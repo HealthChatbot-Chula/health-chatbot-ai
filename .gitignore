@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+.DS_store
 
 # Chroma DB / vector store
 chroma_db_health/
