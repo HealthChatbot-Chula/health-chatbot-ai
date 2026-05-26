@@ -44,9 +44,30 @@ CRITICAL_LAB_ALIASES = {
     "creatinine": "Creatinine",
     "egfr": "eGFR",
     "bun": "BUN",
+    "bp": "Blood Pressure",
+    "blood pressure": "Blood Pressure",
+    "systolic": "SBP",
+    "sbp": "SBP",
+    "diastolic": "DBP",
+    "dbp": "DBP",
+    "ความดันตัวบน": "SBP",
+    "ความดันตัวล่าง": "DBP",
+    "k": "Potassium",
+    "potassium": "Potassium",
     "ast": "AST",
     "alt": "ALT",
 }
+
+FASTING_RELEVANT_LABS = {
+    "FBS",
+    "Glucose",
+    "Total Cholesterol",
+    "HDL",
+    "LDL",
+    "Triglycerides",
+}
+
+SAFETY_FIRST_INTENTS = {"medication_safety", "urgent_red_flag"}
 
 
 def _get_extraction_llm():
@@ -113,6 +134,249 @@ def _latest_assistant_text_before_latest_user(messages: List[BaseMessage]) -> st
     return ""
 
 
+def _looks_like_greeting(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    return normalized in {
+        "สวัสดี",
+        "สวัสดีครับ",
+        "สวัสดีค่ะ",
+        "หวัดดี",
+        "หวัดดีครับ",
+        "หวัดดีค่ะ",
+        "hello",
+        "hi",
+    }
+
+
+def _looks_like_scope_question(text: str) -> bool:
+    normalized = text.strip().lower()
+    scope_phrases = (
+        "โรคอะไร",
+        "โรคอะไรได้บ้าง",
+        "ช่วยอะไรได้บ้าง",
+        "ทำอะไรได้บ้าง",
+        "ให้ข้อมูลเกี่ยวกับ",
+        "ขอบเขต",
+        "scope",
+        "capability",
+    )
+    return any(phrase in normalized for phrase in scope_phrases)
+
+
+def _classify_interaction_intent(text: str, state: AgentState) -> str:
+    normalized = text.strip().lower()
+    lab_values = state.get("extracted_lab_values") or {}
+
+    medication_terms = (
+        "หยุดยา",
+        "หยุดยาเอง",
+        "ลดยา",
+        "เพิ่มยา",
+        "ปรับยา",
+        "กินยา",
+        "ยาความดัน",
+        "ยาเบาหวาน",
+        "ยาไต",
+        "ยามันทำให้",
+        "ต้องหยุดไหม",
+        "หยุดไหม",
+        "หยุดได้ไหม",
+        "ไม่กินยา",
+    )
+    if any(term in normalized for term in medication_terms):
+        return "medication_safety"
+
+    urgent_terms = (
+        "เจ็บหน้าอก",
+        "หอบ",
+        "หายใจไม่ออก",
+        "หมดสติ",
+        "ซึม",
+        "ชัก",
+        "เวียนหัวมาก",
+        "มึนหัวมาก",
+        "อ่อนเพลียมาก",
+        "ปากแห้ง",
+        "ปัสสาวะบ่อย",
+        "รอดู",
+        "ไปพรุ่งนี้",
+        "ฉุกเฉิน",
+    )
+    if any(term in normalized for term in urgent_terms):
+        return "urgent_red_flag"
+
+    if any(name in lab_values for name in {"Potassium", "K"}):
+        return "urgent_red_flag"
+
+    glucose_value = lab_values.get("Glucose") or lab_values.get("FBS")
+    if glucose_value is not None and glucose_value >= 300:
+        return "urgent_red_flag"
+
+    if lab_values:
+        return "lab_interpretation"
+
+    if _mentioned_lab_topics(normalized):
+        return "lab_interpretation"
+
+    if _looks_like_greeting(normalized) or _looks_like_scope_question(normalized):
+        return "general_info"
+
+    return state.get("intent") or "general_health"
+
+
+def _intake_question_text() -> str:
+    return (
+        "ส่งค่าผลตรวจที่อยากให้ช่วยดูได้เลยครับ เช่น LDL 178, HbA1c 6.1 "
+        "หรือความดัน 145/90 mmHg ถ้ามีอายุ เพศ โรคประจำตัว หรือยาที่ใช้อยู่ "
+        "ส่งเพิ่มได้ จะช่วยตีความให้เหมาะกับบริบทมากขึ้นครับ"
+    )
+
+
+def _conversation_user_text(messages: List[BaseMessage]) -> str:
+    parts: List[str] = []
+    for message in messages:
+        if isinstance(message, HumanMessage) or getattr(message, "type", None) == "human":
+            content = message.content
+            if isinstance(content, str):
+                parts.append(content)
+            else:
+                parts.append(json.dumps(content, ensure_ascii=False))
+    return "\n".join(parts)
+
+
+def _mentioned_lab_topics(text: str) -> List[str]:
+    normalized = text.strip().lower()
+    topics: List[str] = []
+
+    topic_patterns = [
+        ("blood_pressure", ("ความดัน", "ค่าความดัน", "bp", "blood pressure")),
+        ("ldl", ("ldl",)),
+        ("hdl", ("hdl",)),
+        ("triglycerides", ("triglyceride", "triglycerides", "ไตรกลีเซอไรด์", "ไขมัน")),
+        ("hba1c", ("hba1c", "a1c", "น้ำตาลสะสม")),
+        ("fbs", ("fbs", "น้ำตาล", "glucose")),
+        ("egfr", ("egfr", "ค่าไต")),
+        ("creatinine", ("creatinine", "ครีเอตินิน")),
+        ("alt_ast", ("alt", "ast", "ค่าตับ")),
+        ("cholesterol", ("cholesterol", "คอเลสเตอรอล")),
+    ]
+
+    for topic, patterns in topic_patterns:
+        if any(pattern in normalized for pattern in patterns):
+            topics.append(topic)
+
+    return topics
+
+
+def _extract_lab_values_from_text(text: str, context: str = "") -> Optional[Dict[str, float]]:
+    normalized_context = f"{context}\n{text}".lower()
+    values: Dict[str, float] = {}
+
+    bp_match = re.search(r"(\d{2,3})\s*/\s*(\d{2,3})", text)
+    if bp_match and (
+        "ความดัน" in normalized_context
+        or "bp" in normalized_context
+        or "blood pressure" in normalized_context
+    ):
+        sbp = float(bp_match.group(1))
+        dbp = float(bp_match.group(2))
+        if 50 <= sbp <= 260 and 30 <= dbp <= 180:
+            values["SBP"] = sbp
+            values["DBP"] = dbp
+
+    named_patterns = [
+        ("FBS", r"\b(?:fbs|fasting blood sugar)\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("Glucose", r"\bglucose\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("HbA1c", r"\b(?:hba1c|a1c)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
+        ("LDL", r"\bldl\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("HDL", r"\bhdl\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("Triglycerides", r"\b(?:tg|triglycerides?|ไตรกลีเซอไรด์)\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("Total Cholesterol", r"\b(?:total cholesterol|cholesterol)\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("eGFR", r"\begfr\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("Creatinine", r"\bcreatinine\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("ALT", r"\balt\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+        ("AST", r"\bast\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+    ]
+
+    for canonical_name, pattern in named_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            values[canonical_name] = float(match.group(1))
+
+    return values or None
+
+
+def _known_profile_phrase(state: AgentState) -> str:
+    parts: List[str] = []
+    age = state.get("age")
+    gender = state.get("gender")
+    if age is not None:
+        parts.append(f"อายุ {age} ปี")
+    if gender == "male":
+        parts.append("เพศชาย")
+    elif gender == "female":
+        parts.append("เพศหญิง")
+    if not parts:
+        return ""
+    return f"โอเคครับ ทราบว่าเจ้าของผลตรวจ{' '.join(parts)}แล้ว "
+
+
+def _topic_specific_lab_question(state: AgentState, messages: List[BaseMessage]) -> Optional[str]:
+    latest_user_message = _latest_user_text(messages)
+    previous_assistant_message = _latest_assistant_text_before_latest_user(messages)
+    all_user_text = _conversation_user_text(messages)
+    topics = _mentioned_lab_topics(f"{all_user_text}\n{latest_user_message}")
+    prefix = _known_profile_phrase(state)
+
+    if "blood_pressure" in topics:
+        if "ความดันที่สูงมีผลได้" in previous_assistant_message:
+            return (
+                f"{prefix}เหลือขอค่าความดันที่วัดได้เป็นตัวเลขครับ เช่น 145/90 mmHg "
+                "หรือบอกตัวบน/ตัวล่างก็ได้ครับ"
+            )
+        return (
+            f"{prefix}ความดันที่สูงมีผลได้ครับ โดยเฉพาะถ้าสูงซ้ำ ๆ เพราะเพิ่มความเสี่ยงต่อหัวใจ "
+            "หลอดเลือด และไต แต่ต้องดูจากตัวเลขที่วัดได้ก่อน "
+            "ขอค่าความดันเป็นตัวเลขหน่อยครับ เช่น 145/90 mmHg "
+            "หรือบอกตัวบน/ตัวล่างก็ได้ครับ ถ้ามีอาการเจ็บหน้าอก หอบ เหนื่อยมาก "
+            "ปวดศีรษะรุนแรง แขนขาอ่อนแรง หรือพูดไม่ชัด ให้รีบพบแพทย์ทันทีครับ"
+        )
+
+    if "fbs" in topics or "hba1c" in topics:
+        return (
+            f"{prefix}ขอค่าน้ำตาลที่ขึ้นในใบตรวจหน่อยครับ เช่น FBS 112, Glucose 130 "
+            "หรือ HbA1c 6.1 ถ้าเป็น FBS/Glucose บอกได้ด้วยว่าตรวจหลังงดอาหารไหมครับ"
+        )
+
+    if {"ldl", "hdl", "triglycerides", "cholesterol"} & set(topics):
+        return (
+            f"{prefix}ขอค่าชุดไขมันที่เห็นในใบตรวจหน่อยครับ เช่น LDL, HDL, "
+            "Triglycerides หรือ Total cholesterol พร้อมตัวเลขที่ขึ้นสูง/ต่ำครับ"
+        )
+
+    if "egfr" in topics or "creatinine" in topics:
+        return (
+            f"{prefix}ขอค่าไตที่อยู่ในใบตรวจหน่อยครับ เช่น eGFR หรือ Creatinine "
+            "พร้อมตัวเลข ถ้ามีค่าเดิมครั้งก่อนส่งมาด้วยจะช่วยดูแนวโน้มได้ครับ"
+        )
+
+    if "alt_ast" in topics:
+        return (
+            f"{prefix}ขอค่าตับที่ขึ้นในใบตรวจหน่อยครับ เช่น ALT หรือ AST พร้อมตัวเลข "
+            "ถ้ามีประวัติดื่มแอลกอฮอล์ ยาที่ใช้ หรือไวรัสตับอักเสบ บอกเพิ่มได้ครับ"
+        )
+
+    return None
+
+
+def _needs_fasting_status(lab_values: Optional[Dict[str, float]]) -> bool:
+    if not lab_values:
+        return False
+    return any(name in FASTING_RELEVANT_LABS for name in lab_values)
+
+
 def _message_content_to_text(content: Any) -> str:
     """Normalize LLM message content into text before JSON parsing."""
 
@@ -155,6 +419,7 @@ def _normalize_gender(value: Any) -> Optional[str]:
     if value is None:
         return None
     normalized = str(value).strip().lower()
+    normalized = re.sub(r"^(เพศ|sex|gender)\s*[:：-]?\s*", "", normalized)
     if normalized in {"male", "man", "m", "ชาย", "ผู้ชาย"}:
         return "male"
     if normalized in {"female", "woman", "f", "หญิง", "ผู้หญิง"}:
@@ -176,10 +441,18 @@ def _normalize_yes_no(value: Any) -> Optional[str]:
 def _normalize_age(value: Any) -> Optional[int]:
     if value is None or value == "":
         return None
+    raw_text = str(value).strip().lower()
     try:
-        age = int(float(value))
+        age = int(float(raw_text))
     except (TypeError, ValueError):
-        return None
+        age_match = (
+            re.search(r"(?:อายุ|age)\s*[:：-]?\s*(\d{1,3})", raw_text)
+            or re.search(r"\b(\d{1,3})\s*(?:ปี|years?|yrs?|yo)", raw_text)
+            or re.search(r"^\s*(\d{1,3})\s*(?:ชาย|หญิง|male|female|m|f)?\s*$", raw_text)
+        )
+        if not age_match:
+            return None
+        age = int(age_match.group(1))
     if 0 < age < 130:
         return age
     return None
@@ -314,6 +587,14 @@ def _updates_from_pending_slot(state: AgentState, latest_user_message: str) -> D
             updates["gender"] = gender
             updates["pending_slot"] = None
 
+    elif pending_slot == "extracted_lab_values":
+        context = _conversation_user_text(state.get("messages", []))
+        lab_values = _extract_lab_values_from_text(latest_user_message, context)
+        merged_labs = _merge_lab_values(state.get("extracted_lab_values"), lab_values)
+        if merged_labs:
+            updates["extracted_lab_values"] = merged_labs
+            updates["pending_slot"] = None
+
     return updates
 
 
@@ -345,6 +626,11 @@ def _merge_extracted_slots(state: AgentState, extracted: Dict[str, Any]) -> Dict
             updates[slot_name] = merged_list
 
     lab_values = _normalize_lab_values(extracted.get("extracted_lab_values"))
+    deterministic_lab_values = _extract_lab_values_from_text(
+        extracted.get("_latest_user_message", ""),
+        extracted.get("_conversation_context", ""),
+    )
+    lab_values = _merge_lab_values(lab_values, deterministic_lab_values)
     merged_labs = _merge_lab_values(state.get("extracted_lab_values"), lab_values)
     if merged_labs is not state.get("extracted_lab_values"):
         updates["extracted_lab_values"] = merged_labs
@@ -403,6 +689,7 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
 - แปลง fasting_status ให้เป็น "yes" หรือ "no" เท่านั้น
 - ค่าผลแล็บให้ดึงเฉพาะตัวเลข ไม่ต้องใส่หน่วย ตัวอย่าง:
   {{"FBS": 120.0, "HbA1c": 6.4, "LDL": 140.0}}
+- ถ้าผู้ใช้บอกความดัน เช่น 145/90 หรือ ตัวบน 145 ตัวล่าง 90 ให้ใส่ {{"SBP": 145.0, "DBP": 90.0}}
 
 รูปแบบ JSON ที่ต้องตอบ:
 {{
@@ -426,47 +713,75 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
         )
         raw_text = _message_content_to_text(response.content)
         extracted = _parse_raw_json_object(raw_text)
+        extracted["_latest_user_message"] = latest_user_message
+        extracted["_conversation_context"] = _conversation_user_text(messages)
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[slot_filling] JSON parsing failed: {exc}")
-        return {}
+        return {
+            **pending_updates,
+            "intent": _classify_interaction_intent(latest_user_message, state_for_prompt),
+        }
     except Exception as exc:
         print(f"[slot_filling] Extraction failed: {exc}")
-        return {}
+        return {
+            **pending_updates,
+            "intent": _classify_interaction_intent(latest_user_message, state_for_prompt),
+        }
 
     extracted_updates = _merge_extracted_slots(state_for_prompt, extracted)
-    return {**pending_updates, **extracted_updates}
+    merged_state: AgentState = {**state_for_prompt, **extracted_updates}
+    return {
+        **pending_updates,
+        **extracted_updates,
+        "intent": _classify_interaction_intent(latest_user_message, merged_state),
+    }
 
 
 def route_after_extraction(state: AgentState) -> str:
     """Route to the first missing critical slot, in priority order."""
 
+    if state.get("intent") in SAFETY_FIRST_INTENTS:
+        return "our_agent"
+
     lab_values = state.get("extracted_lab_values")
     if not lab_values:
         return "ask_lab_node"
 
-    if state.get("fasting_status") is None:
-        return "ask_fasting_node"
-
-    if state.get("age") is None:
-        return "ask_age_node"
-
-    if state.get("gender") is None:
-        return "ask_gender_node"
-
+    # Once a lab value is available, answer the user's primary question first.
+    # The analyst prompt can ask for age, gender, or fasting status afterward if
+    # it would materially improve personalization.
     return "our_agent"
 
 
 def ask_lab_node(state: AgentState) -> Dict[str, Any]:
+    messages = state.get("messages", [])
+    latest_user_message = _latest_user_text(messages)
+    topic_specific_question = _topic_specific_lab_question(state, messages)
+
+    if topic_specific_question:
+        content = topic_specific_question
+    elif _looks_like_scope_question(latest_user_message):
+        content = (
+            "ผมช่วยให้ข้อมูลเบื้องต้นและช่วยแปลผลตรวจในกลุ่มหลัก ๆ เหล่านี้ครับ:\n"
+            "- เบาหวาน\n"
+            "- ความดันโลหิตสูง\n"
+            "- ไขมันในเลือดสูง\n"
+            "- โรคไตเรื้อรัง (CKD)\n"
+            "- ภาวะที่เกี่ยวข้องกับการทำงานของตับ\n\n"
+            f"{_intake_question_text()}"
+        )
+    elif _looks_like_greeting(latest_user_message):
+        content = (
+            "สวัสดีครับ ผมช่วยดูผลตรวจสุขภาพเบื้องต้นได้ครับ\n\n"
+            f"{_intake_question_text()}"
+        )
+    else:
+        content = _intake_question_text()
+
     return {
         "pending_slot": "extracted_lab_values",
         "messages": [
-            AIMessage(
-                content=(
-                    "กรุณาส่งค่าผลตรวจสุขภาพที่ต้องการให้ช่วยดู เช่น FBS, "
-                    "HbA1c, LDL, HDL, triglycerides, creatinine, eGFR, AST "
-                    "หรือ ALT ครับ"
-                )
-            )
+            AIMessage(content=content)
         ]
     }
 
@@ -485,12 +800,15 @@ def ask_fasting_node(state: AgentState) -> Dict[str, Any]:
 
 
 def ask_age_node(state: AgentState) -> Dict[str, Any]:
+    if state.get("gender") is None:
+        question = "ผู้ที่เป็นเจ้าของผลตรวจอายุเท่าไร และเพศชายหรือหญิงครับ?"
+    else:
+        question = "ผู้ที่เป็นเจ้าของผลตรวจอายุเท่าไรครับ?"
+
     return {
         "pending_slot": "age",
         "messages": [
-            AIMessage(
-                content="ผู้ที่เป็นเจ้าของผลตรวจอายุเท่าไรครับ?"
-            )
+            AIMessage(content=question)
         ]
     }
 
