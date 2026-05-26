@@ -44,15 +44,15 @@ Health Chatbot เป็น backend chatbot ภาษาไทยสำหรั
 ```mermaid
 flowchart LR
     user["ผู้ใช้ / OpenWebUI"] --> api["FastAPI Backend<br/>/v1/chat/completions"]
-    api --> graph["LangGraph Health Agent"]
-    graph --> llm_extract["Gemini Extractor<br/>slot filling"]
-    graph --> rag["RAG Retrieval<br/>Chroma + HuggingFace Embeddings"]
-    graph --> llm_answer["Gemini Chat Model<br/>medical response"]
-    graph --> guard["Input/Output Guardrails"]
+    api --> health_graph["LangGraph Health Agent"]
+    health_graph --> llm_extract["Gemini Extractor<br/>slot filling"]
+    health_graph --> rag["RAG Retrieval<br/>Chroma + HuggingFace Embeddings"]
+    health_graph --> llm_answer["Gemini Chat Model<br/>medical response"]
+    health_graph --> guard["Input/Output Guardrails"]
     rag --> chroma[("Chroma DB<br/>health knowledge")]
     chroma --> data["Processed Markdown<br/>diabetes / hypertension / dyslipidemia / kidney"]
     api --> eval["Eval Simulator<br/>Patient Simulator + Judge"]
-    eval --> graph
+    eval --> health_graph
     eval --> judge["LLM Judge<br/>score + checkpoints"]
 ```
 
