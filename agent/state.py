@@ -1,15 +1,27 @@
-from typing import Annotated, Optional, Sequence, TypedDict
+from typing import Annotated, Dict, List, Optional, TypedDict
+
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
-class AgentState(TypedDict):
+
+class AgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
 
-    # debug
+    # Runtime/debug metadata used by the existing graph.
     summary: str
-    steps: list[str]                    # log ว่า agent ทำอะไรไปบ้าง
-    current_node: Optional[str]         # ตอนนี้อยู่ node ไหน
+    steps: list[str]
+    current_node: Optional[str]
     blocked: bool
 
-    # medical-specific
-    intent: Optional[str]               # symptom, general_health
+    # Intent classification.
+    intent: Optional[str]
+
+    # Slot-filling / medical checkup fields.
+    age: Optional[int]
+    gender: Optional[str]  # "male" or "female"
+    underlying_disease: Optional[List[str]]
+    current_medications: Optional[List[str]]
+    current_symptoms: Optional[List[str]]
+    fasting_status: Optional[str]  # "yes" or "no"
+    extracted_lab_values: Optional[Dict[str, float]]
+    pending_slot: Optional[str]
