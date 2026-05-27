@@ -34,6 +34,8 @@ class _Span:
     name: str
     elapsed_ms: float = 0.0
     children: list["_Span"] = field(default_factory=list)
+    input_tokens: int = 0      
+    output_tokens: int = 0
 
 
 @contextmanager
@@ -54,9 +56,6 @@ def trace(name: str, **extra):
     finally:
         span.elapsed_ms = (time.perf_counter() - t0) * 1000
         stack.pop()
-        # print inline เฉพาะ child (มี indent) เพื่อให้เห็น realtime
-        if stack:  # ยังมี parent → เป็น child
-            _print_inline(span, indent=True)
 
 
 def trace_fn(name: str | None = None):
@@ -89,6 +88,16 @@ def trace_fn(name: str | None = None):
         return wrapper
     return decorator
 
+def record_tokens(name_or_span, response) -> None:
+    meta = getattr(response, "usage_metadata", None) or {}
+    input_tok = meta.get("input_tokens", 0) or meta.get("prompt_token_count", 0)
+    output_tok = meta.get("output_tokens", 0) or meta.get("candidates_token_count", 0)
+    
+    stack = _get_stack()
+    if stack:
+        stack[-1].input_tokens += input_tok
+        stack[-1].output_tokens += output_tok
+
 
 _BAR   = 36
 _WARN  = 500
@@ -109,7 +118,10 @@ def _bar(ms: float, max_ms: float) -> str:
 def _print_inline(s: _Span, indent: bool) -> None:
     c = _col(s.elapsed_ms)
     prefix = "  " if not indent else ""
-    print(f"{_C}⏱  {_R}{prefix}{s.name:<48}{c}{s.elapsed_ms:>8.1f} ms{_R}")
+    tok_info = ""
+    if s.input_tokens or s.output_tokens:
+        tok_info = f"  {_D}[in:{s.input_tokens} out:{s.output_tokens}]{_R}"
+    print(f"{_C}⏱  {_R}{prefix}{s.name:<48}{c}{s.elapsed_ms:>8.1f} ms{_R}{tok_info}")
 
 
 class LatencyReport:
@@ -143,14 +155,21 @@ class LatencyReport:
             c = _col(s.elapsed_ms)
             pct = s.elapsed_ms / total_ms * 100
             bar = _bar(s.elapsed_ms, max_ms)
-            indent = "    " * depth
+            indent_str = "    " * depth
             prefix = "└─ " if depth > 0 else ""
-            print(f"  {indent}{prefix}{s.name:<44} {c}{s.elapsed_ms:>7.1f} ms{_R}  {_D}{bar} {pct:4.1f}%{_R}")
+            tok_str = ""
+            if s.input_tokens or s.output_tokens:
+                tok_str = f"  {_D}in:{s.input_tokens:>5} out:{s.output_tokens:>4}{_R}"
+            print(f"  {indent_str}{prefix}{s.name:<44} {c}{s.elapsed_ms:>7.1f} ms{_R}{tok_str}  {_D}{bar} {pct:4.1f}%{_R}")
 
         llm_ms = sum(s.elapsed_ms for s, _ in all_spans if "LLM" in s.name)
+        total_in = sum(s.input_tokens for s, _ in all_spans) 
+        total_out = sum(s.output_tokens for s, _ in all_spans)
         print(sep)
         print(f"  {_B}Total wall time  {_R}{_col(total_ms)}{total_ms:>8.1f} ms{_R}")
         if llm_ms:
             print(f"  {_B}LLM calls only  {_R}{_col(llm_ms)}{llm_ms:>8.1f} ms{_R}  {_D}({llm_ms/total_ms*100:.0f}% of total){_R}")
+        if total_in or total_out:                              
+            print(f"  {_B}Tokens total     {_R}in:{total_in}  out:{total_out}  total:{total_in + total_out}")
         print(f"{_B}{sep}{_R}\n")
         _clear()

@@ -25,7 +25,7 @@ from .slot_filling_graph import (
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
-from latency_tracer import trace, trace_fn
+from latency_tracer import trace, trace_fn, record_tokens
 
 load_dotenv()
 
@@ -235,7 +235,9 @@ def guardrail_input_node(state: AgentState):
     )   
 
     with trace("intent_model.invoke [LLM #1 — flash-lite]"):
-        result = intent_model.invoke(guard_prompt).content.strip()
+        result_response = intent_model.invoke(guard_prompt)
+        record_tokens("intent_model", result_response)
+        result = result_response.content.strip()
 
     # Parse JSON จาก LLM
     try:
@@ -311,7 +313,9 @@ def guardrail_output_node(state: AgentState):
     )
 
     with trace("guard_output_model.invoke [LLM #3 — flash-lite]"):
-        result = guard_output_model.invoke(guard_prompt).content.strip()
+        result_response = guard_output_model.invoke(guard_prompt)
+        record_tokens("guard_output_model", result_response)
+        result = result_response.content.strip()
 
     try:
         clean = result.replace("```json", "").replace("```", "").strip()
@@ -468,6 +472,7 @@ def call_model(state: AgentState):
     print(f"[2] >>> AGENT NODE: Generating response...")
     with trace("chat_model.invoke [LLM #2 — flash]"):
         response = chat_model.invoke([SystemMessage(content=system_prompt)] + messages)
+        record_tokens("chat_model", response)
     
     return {
         "messages": [response], 
