@@ -13,6 +13,15 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from .state import AgentState
 from .rag_utils import retrieve_context
+from .slot_filling_graph import (
+    ask_age_node,
+    ask_fasting_node,
+    ask_gender_node,
+    ask_lab_node,
+    extract_info_node,
+    route_after_extraction,
+    _updates_from_pending_slot,
+)
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
@@ -193,6 +202,18 @@ def guardrail_input_node(state: AgentState):
 
     print(f"[1.5] 🛡️ INPUT GUARDRAIL: Checking relevance...")
 
+    pending_slot_updates = _updates_from_pending_slot(state, last_user_message)
+    if pending_slot_updates:
+        print(
+            "    ✅ ALLOWED: user is answering the pending slot "
+            f"{state.get('pending_slot')!r}"
+        )
+        return {
+            "blocked": False,
+            "current_node": "guardrail_input",
+            "steps": state.get("steps", []) + ["guardrail_input_pending_slot_allowed"],
+        }
+
     guard_prompt = (
         "คุณคือระบบกรองคำถามของแอปพลิเคชันสุขภาพ\n"
         "หน้าที่: ตัดสินว่าข้อความของผู้ใช้ควรได้รับการประมวลผลต่อหรือไม่\n\n"
@@ -359,8 +380,13 @@ def lab_prompt(context: str, summary_context: str) -> str:
         "หลักการตอบ:\n"
         "1. ถ้าผู้ใช้ถามทั่วไป ให้ตอบจากความรู้เบื้องต้น โดยอ้างอิงคู่มือด้านบนถ้าเกี่ยวข้อง\n"
         "2. ถ้าผู้ใช้ส่งค่าแลปมา ให้ตีความโดยเทียบกับข้อมูลอ้างอิงด้านบน และใช้คำว่า 'แนวโน้ม' หรือ 'ความเสี่ยงเบื้องต้น' เท่านั้น\n"
-        "3. หากคู่มือระบุเป้าหมายตามช่วงอายุ ให้ยึดตามนั้นเป็นหลัก\n"
-        "4. สามารถให้คำเตือนเชิงพฤติกรรม เช่น ระวังหน้ามืดหรือล้ม\n\n"
+        "3. ถ้ามีค่าผลตรวจแล้ว ให้ตอบความหมายเบื้องต้นและสิ่งที่ควรทำก่อนเสมอ ห้ามเริ่มด้วยการถามอายุ เพศ หรืองดอาหารจนยังไม่ตอบคำถามหลัก\n"
+        "4. หากคู่มือระบุเป้าหมายตามช่วงอายุ ให้ยึดตามนั้นเป็นหลักเมื่อมีข้อมูลอายุ\n"
+        "5. สามารถให้คำเตือนเชิงพฤติกรรม เช่น ระวังหน้ามืดหรือล้ม\n\n"
+        "6. ถ้าผู้ใช้ถามเรื่องหยุดยา ปรับยา หรือมีอาการ/ค่าที่เสี่ยง ให้ตอบ safety action ก่อนทันที "
+        "ห้ามรอถามอายุ เพศ หรืองดอาหารก่อนตอบคำถามหลัก และให้ถามข้อมูลเพิ่มเฉพาะหลังจากให้คำแนะนำความปลอดภัยแล้ว\n"
+        "7. ถ้าผู้ใช้ทักทายหรือถามว่าระบบช่วยเรื่องอะไรได้บ้าง และยังไม่มีผลตรวจ อายุ หรือเพศ "
+        "ให้ตอบขอบเขตสั้นๆ แล้วถามต่อให้ผู้ใช้ส่งค่าผลตรวจพร้อมอายุและเพศเสมอ\n\n"
         "รูปแบบคำตอบ:\n"
         "- ตอบเป็น bullet point สั้นๆ ไม่เกิน 5 ข้อ\n"
         "- แต่ละข้อไม่เกิน 1-2 ประโยค\n"
@@ -370,7 +396,7 @@ def lab_prompt(context: str, summary_context: str) -> str:
         "- สรุปเป็นการวินิจฉัยโรค\n"
         "- ตอบยาวเกิน 10 ประโยค\n\n"
         "ถ้าข้อมูลไม่พอ:\n"
-        "ให้ถามข้อมูลเพิ่มเติมที่จำเป็น เช่น อายุ น้ำหนัก โรคประจำตัว\n"
+        "ให้ตอบเท่าที่บอกได้ก่อน แล้วค่อยถามข้อมูลเพิ่มเติมที่จำเป็นตามเคสท้ายคำตอบ ไม่ถามข้อมูลที่ไม่เกี่ยว เช่น ไม่ถามงดอาหารในเคส eGFR/ยา/ไตที่ไม่ต้องใช้บริบทนี้\n"
     )
  
 def no_context_prompt() -> str:
@@ -378,8 +404,40 @@ def no_context_prompt() -> str:
         core_identity()
         + "\nขออภัยครับ ข้อมูลที่ถามอยู่นอกขอบเขตที่ผมช่วยได้ในตอนนี้\n"
         "ผมช่วยแปลผลเบื้องต้นได้เฉพาะเรื่อง เบาหวาน ความดัน ไขมัน โรคไต และตับ\n"
-        "หากมีผลแลปในหัวข้อเหล่านี้ ยินดีช่วยแปลผลให้ครับ\n"
+        "หากมีผลแลปในหัวข้อเหล่านี้ รบกวนส่งค่าผลตรวจพร้อมอายุและเพศของผู้ที่เป็นเจ้าของผลตรวจครับ\n"
     )
+    
+def _analysis_slot_context(state: AgentState) -> str:
+    labs = state.get("extracted_lab_values") or {}
+    lab_text = ", ".join(f"{name}: {value}" for name, value in labs.items()) or "-"
+    return (
+        "\n\nข้อมูล structured ที่สกัดได้ก่อนวิเคราะห์:"
+        f"\n- intent: {state.get('intent')}"
+        f"\n- age: {state.get('age')}"
+        f"\n- gender: {state.get('gender')}"
+        f"\n- fasting_status: {state.get('fasting_status')}"
+        f"\n- underlying_disease: {state.get('underlying_disease')}"
+        f"\n- current_medications: {state.get('current_medications')}"
+        f"\n- current_symptoms: {state.get('current_symptoms')}"
+        f"\n- extracted_lab_values: {lab_text}"
+    )
+
+
+def _analysis_retrieval_query(state: AgentState, fallback_query: str) -> str:
+    labs = state.get("extracted_lab_values") or {}
+    if not labs:
+        return fallback_query
+
+    query_parts = [
+        "health checkup lab interpretation",
+        "diabetes dyslipidemia kidney liver blood pressure",
+        f"age {state.get('age')}",
+        f"gender {state.get('gender')}",
+        f"fasting {state.get('fasting_status')}",
+        f"intent {state.get('intent')}",
+    ]
+    query_parts.extend(f"{name} {value}" for name, value in labs.items())
+    return " ".join(str(part) for part in query_parts if part)
 
 @trace_fn("call_model [total]")
 def call_model(state: AgentState):
@@ -392,11 +450,15 @@ def call_model(state: AgentState):
     
     # 1. ดึงข้อมูลจาก Vector DB (Markdown)
     with trace("retrieve_context [vector search]"):
-        context = retrieve_context(last_user_message)
+        retrieval_query = _analysis_retrieval_query(state, last_user_message)
+        context = retrieve_context(retrieval_query)
     
     # Adding smurrized chat to the System Message
     summary_context = f"\n\nสรุปบริบทการสนทนาก่อนหน้านี้: {summary}" if summary else ""
     
+    summary_context += _analysis_slot_context(state)
+    
+    print("=== RETRIEVAL QUERY ===", retrieval_query)
     print("=== CONTEXT ===", context)
     
     # 2. เลือก prompt ตามว่ามี context หรือไม่
@@ -419,6 +481,11 @@ def build_graph():
     # ----- add nodes -----
     graph.add_node("input", input_node)
     graph.add_node("guardrail_input", guardrail_input_node)
+    graph.add_node("extract_info_node", extract_info_node)
+    graph.add_node("ask_lab_node", ask_lab_node)
+    graph.add_node("ask_fasting_node", ask_fasting_node)
+    graph.add_node("ask_age_node", ask_age_node)
+    graph.add_node("ask_gender_node", ask_gender_node)
     graph.add_node("our_agent", call_model)
     graph.add_node("guardrail_output", guardrail_output_node)
     graph.add_node("summarize", summarize_conversation)
@@ -434,9 +501,28 @@ def build_graph():
         route_after_input_guardrail,
         {
             "blocked": END,
-            "continue": "our_agent"
+            "continue": "extract_info_node"
         }
     )
+
+    graph.add_conditional_edges(
+        "extract_info_node",
+        route_after_extraction,
+        {
+            "ask_lab_node": "ask_lab_node",
+            "ask_fasting_node": "ask_fasting_node",
+            "ask_age_node": "ask_age_node",
+            "ask_gender_node": "ask_gender_node",
+            "our_agent": "our_agent",
+        },
+    )
+
+    # Question nodes finish the current turn. The next user reply re-enters
+    # this graph at "input" with the accumulated chat history/state.
+    graph.add_edge("ask_lab_node", END)
+    graph.add_edge("ask_fasting_node", END)
+    graph.add_edge("ask_age_node", END)
+    graph.add_edge("ask_gender_node", END)
 
     graph.add_conditional_edges(
         "our_agent",
