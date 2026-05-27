@@ -1,5 +1,5 @@
 from dotenv import load_dotenv 
-import os
+import sys, os
 import json 
 import tempfile
 from langchain_core.messages import BaseMessage, RemoveMessage # The foundational class for all message types in LangGraph
@@ -14,6 +14,9 @@ from langgraph.prebuilt import ToolNode
 from .state import AgentState
 from .rag_utils import retrieve_context
 import uuid
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
+from latency_tracer import trace, trace_fn
 
 load_dotenv()
 
@@ -72,6 +75,7 @@ chat_model = ChatVertexAI(
     model="gemini-2.5-flash"
 )
 
+guard_output_model = ChatVertexAI(model="gemini-2.5-flash-lite", temperature=0)
 
 # ----- Function -----
 
@@ -93,6 +97,7 @@ def input_node(state: AgentState):
 
     return state
 
+@trace_fn("summarize_conversation [total]")
 def summarize_conversation(state: AgentState):
     """
     Summarizing both user and AI conversation, and keeping only 3 latest chat messages
@@ -174,6 +179,7 @@ def summarize_conversation(state: AgentState):
     
     return {"summary": summary}
 
+@trace_fn("guardrail_input_node [total]")
 def guardrail_input_node(state: AgentState):
     """
     ตรวจสอบ input ของ user ก่อนเข้าระบบหลัก
@@ -205,9 +211,10 @@ def guardrail_input_node(state: AgentState):
         "ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น:\n"
         '{"action": "ALLOW" หรือ "BLOCK", "reason": "เหตุผลสั้นๆ 1 ประโยค"}\n\n'
         f"ข้อความของผู้ใช้: {last_user_message}"
-    )
+    )   
 
-    result = intent_model.invoke(guard_prompt).content.strip()
+    with trace("intent_model.invoke [LLM #1 — flash-lite]"):
+        result = intent_model.invoke(guard_prompt).content.strip()
 
     # Parse JSON จาก LLM
     try:
@@ -255,6 +262,7 @@ def route_after_input_guardrail(state: AgentState):
         return "blocked"
     return "continue"
 
+@trace_fn("guardrail_output_node [total]")
 def guardrail_output_node(state: AgentState):
     """
     ตรวจสอบ output ก่อนส่งให้ user
@@ -281,7 +289,8 @@ def guardrail_output_node(state: AgentState):
         f"ข้อความที่ต้องตรวจ:\n{last_ai_message}"
     )
 
-    result = chat_model.invoke(guard_prompt).content.strip()
+    with trace("guard_output_model.invoke [LLM #3 — flash-lite]"):
+        result = guard_output_model.invoke(guard_prompt).content.strip()
 
     try:
         clean = result.replace("```json", "").replace("```", "").strip()
@@ -371,7 +380,8 @@ def no_context_prompt() -> str:
         "ผมช่วยแปลผลเบื้องต้นได้เฉพาะเรื่อง เบาหวาน ความดัน ไขมัน โรคไต และตับ\n"
         "หากมีผลแลปในหัวข้อเหล่านี้ ยินดีช่วยแปลผลให้ครับ\n"
     )
-    
+
+@trace_fn("call_model [total]")
 def call_model(state: AgentState):
     """
     Node สำหรับตอบคำถาม: ดึง Context มาใส่ใน Prompt จริงๆ
@@ -381,7 +391,8 @@ def call_model(state: AgentState):
     last_user_message = messages[-1].content 
     
     # 1. ดึงข้อมูลจาก Vector DB (Markdown)
-    context = retrieve_context(last_user_message)
+    with trace("retrieve_context [vector search]"):
+        context = retrieve_context(last_user_message)
     
     # Adding smurrized chat to the System Message
     summary_context = f"\n\nสรุปบริบทการสนทนาก่อนหน้านี้: {summary}" if summary else ""
@@ -393,7 +404,8 @@ def call_model(state: AgentState):
 
     # 3. ส่งคำสั่งที่มี "ข้อมูลอ้างอิง (Context)" ไปให้ Gemini
     print(f"[2] >>> AGENT NODE: Generating response...")
-    response = chat_model.invoke([SystemMessage(content=system_prompt)] + messages)
+    with trace("chat_model.invoke [LLM #2 — flash]"):
+        response = chat_model.invoke([SystemMessage(content=system_prompt)] + messages)
     
     return {
         "messages": [response], 

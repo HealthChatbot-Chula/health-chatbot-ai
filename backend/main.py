@@ -12,6 +12,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from latency_tracer import trace, LatencyReport
+
 # ลบ chat_memory_store ออกไปเลย! เราจะใช้ความจำจาก Open WebUI แทน
 
 app = FastAPI()
@@ -1056,6 +1061,10 @@ async def chat_completions(req: ChatRequest):
             )
         assistant_content = _run_openwebui_simulation(last_message_content)
         return _response_payload(assistant_content, usage_data)
+    
+    # Latency Report
+    preview = last_message_content[:60].replace("\n", " ")
+    report  = LatencyReport.begin(f"'{preview}…'")
 
     if is_webui_task:
         print("\n[Interceptor] Open WebUI automated task detected. Bypassing LangGraph.")
@@ -1066,9 +1075,6 @@ async def chat_completions(req: ChatRequest):
         
         # Extract token usage for the automated task
         meta = getattr(response, "usage_metadata", {}) or {}
-        usage_data["prompt_tokens"] = meta.get("input_tokens", 0)
-        usage_data["completion_tokens"] = meta.get("output_tokens", 0)
-        usage_data["total_tokens"] = meta.get("total_tokens", 0)
         
     else:
         print("\n[Interceptor] Normal user message detected. Routing to LangGraph.")
@@ -1087,9 +1093,12 @@ async def chat_completions(req: ChatRequest):
 
         # Extract token usage for the normal chat
         meta = getattr(assistant_msg, "usage_metadata", {}) or {}
-        usage_data["prompt_tokens"] = meta.get("input_tokens", 0)
-        usage_data["completion_tokens"] = meta.get("output_tokens", 0)
-        usage_data["total_tokens"] = meta.get("total_tokens", 0)
+        
+    usage_data["prompt_tokens"] = meta.get("input_tokens", 0)
+    usage_data["completion_tokens"] = meta.get("output_tokens", 0)
+    usage_data["total_tokens"] = meta.get("total_tokens", 0)
+        
+    report.print()
 
     # 4. Return the response to Open WebUI
     return _response_payload(assistant_content, usage_data)
