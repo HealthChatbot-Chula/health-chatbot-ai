@@ -57,6 +57,16 @@ SLOT_FIELD_NAMES = (
 
 slot_memory_store: dict[str, dict[str, Any]] = {}
 
+FAST_PATH_PENDING_SLOTS = {"gender", "age", "fasting_status"}
+FASTING_FOLLOWUP_LABS = {
+    "FBS",
+    "Glucose",
+    "Total Cholesterol",
+    "HDL",
+    "LDL",
+    "Triglycerides",
+}
+
 # ---------- OpenAI-compatible schema ----------
 class Message(BaseModel):
     role: str
@@ -181,17 +191,141 @@ def _save_slot_state(conversation_key: str, graph_result: dict[str, Any]) -> Non
             current_slots[field_name] = graph_result.get(field_name)
 
 
-def _response_payload(content: str, usage_data: dict[str, int] | None = None):
+def _needs_fasting_followup(slot_state: dict[str, Any]) -> bool:
+    labs = slot_state.get("extracted_lab_values") or {}
+    return any(name in FASTING_FOLLOWUP_LABS for name in labs)
+
+
+def _followup_question_for_slot(pending_slot: str) -> Optional[str]:
+    if pending_slot == "gender":
+        return (
+            "เพศของผู้ที่เป็นเจ้าของผลตรวจคือชายหรือหญิงครับ? "
+            "ข้อมูลนี้ช่วยให้เทียบช่วงอ้างอิงได้เหมาะสมขึ้น"
+        )
+
+    if pending_slot == "age":
+        return "ผู้ที่เป็นเจ้าของผลตรวจอายุเท่าไรครับ?"
+
+    if pending_slot == "fasting_status":
+        return "ผลเลือดชุดนี้ตรวจหลังงดอาหารหรือไม่ครับ? กรุณาตอบว่าใช่หรือไม่ใช่"
+
+    return None
+
+
+def _next_followup_slot(slot_state: dict[str, Any]) -> Optional[str]:
+    labs = slot_state.get("extracted_lab_values") or {}
+    if not labs:
+        return None
+
+    if slot_state.get("gender") is None:
+        return "gender"
+
+    if slot_state.get("age") is None:
+        return "age"
+
+    if slot_state.get("fasting_status") is None and _needs_fasting_followup(slot_state):
+        return "fasting_status"
+
+    return None
+
+
+def _pending_slot_fast_response(
+    conversation_key: str,
+    latest_user_message: str,
+) -> Optional[tuple[str, Optional[dict[str, Any]]]]:
+    slot_state = _initial_slot_state(conversation_key)
+    pending_slot = slot_state.get("pending_slot")
+
+    if pending_slot not in FAST_PATH_PENDING_SLOTS:
+        return None
+
+    from agent.slot_filling_graph import _updates_from_pending_slot
+
+    slot_updates = _updates_from_pending_slot(slot_state, latest_user_message)
+    parsed_slot_answer = any(
+        field_name in slot_updates
+        for field_name in ("gender", "age", "fasting_status")
+    )
+    if not parsed_slot_answer:
+        followup_question = _followup_question_for_slot(str(pending_slot))
+        if not followup_question:
+            return None
+        response_metadata = _slot_response_metadata({"pending_slot": pending_slot})
+        print(
+            "[Slot Fast Path] Could not parse pending slot "
+            f"{pending_slot!r}; repeating fixed question without Gemini."
+        )
+        return followup_question, response_metadata
+
+    if slot_updates.get("pending_slot") is not None:
+        return None
+
+    updated_state = {**slot_state, **slot_updates}
+    next_pending_slot = _next_followup_slot(updated_state)
+
+    if not next_pending_slot:
+        _save_slot_state(conversation_key, updated_state)
+        return None
+
+    followup_question = _followup_question_for_slot(next_pending_slot)
+    if not followup_question:
+        return None
+
+    updated_state["pending_slot"] = next_pending_slot
+    _save_slot_state(conversation_key, updated_state)
+    response_metadata = _slot_response_metadata({"pending_slot": next_pending_slot})
+
+    print(
+        "[Slot Fast Path] Parsed pending slot "
+        f"{pending_slot!r}; asking next slot {next_pending_slot!r} without Gemini."
+    )
+
+    return followup_question, response_metadata
+
+
+def _slot_response_metadata(graph_result: dict[str, Any]) -> Optional[dict[str, Any]]:
+    pending_slot = graph_result.get("pending_slot")
+    choices_by_slot: dict[str, list[dict[str, str]]] = {
+        "gender": [
+            {"label": "ชาย", "value": "ชาย"},
+            {"label": "หญิง", "value": "หญิง"},
+        ],
+        "fasting_status": [
+            {"label": "ใช่", "value": "ใช่"},
+            {"label": "ไม่ใช่", "value": "ไม่ใช่"},
+        ],
+    }
+
+    if not pending_slot:
+        return None
+
+    metadata: dict[str, Any] = {"pending_slot": pending_slot}
+    choices = choices_by_slot.get(str(pending_slot))
+    if choices:
+        metadata["choices"] = choices
+
+    return metadata
+
+
+def _response_payload(
+    content: str,
+    usage_data: Optional[dict[str, int]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+):
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content
+    }
+    if metadata:
+        message["metadata"] = metadata
+
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content
-                },
+                "message": message,
                 "finish_reason": "stop"
             }
         ],
@@ -1376,6 +1510,11 @@ async def chat_completions(req: ChatRequest):
     else:
         print("\n[Interceptor] Normal user message detected. Routing to LangGraph.")
         conversation_key = _conversation_key(req)
+        fast_response = _pending_slot_fast_response(conversation_key, last_message_content)
+        if fast_response:
+            assistant_content, response_metadata = fast_response
+            return _response_payload(assistant_content, usage_data, response_metadata)
+
         # 2. Pass the entire history into LangGraph
         graph, _ = _load_agent_resources()
         result = graph.invoke({
@@ -1398,7 +1537,8 @@ async def chat_completions(req: ChatRequest):
         usage_data["total_tokens"] = meta.get("total_tokens", 0)
 
     # 4. Return the response to Open WebUI
-    return _response_payload(assistant_content, usage_data)
+    response_metadata = _slot_response_metadata(result) if not is_webui_task else None
+    return _response_payload(assistant_content, usage_data, response_metadata)
 
 
 @app.get("/eval/simulator")

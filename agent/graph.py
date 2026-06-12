@@ -22,6 +22,7 @@ from .slot_filling_graph import (
     route_after_extraction,
     _updates_from_pending_slot,
 )
+from typing import Optional, Tuple
 import uuid
 
 load_dotenv()
@@ -71,6 +72,15 @@ def multiply(a: int, b: int):
 tools = []
 
 # model = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite").bind_tools(tools)
+
+FASTING_FOLLOWUP_LABS = {
+    "FBS",
+    "Glucose",
+    "Total Cholesterol",
+    "HDL",
+    "LDL",
+    "Triglycerides",
+}
 
 intent_model = ChatVertexAI(
     model="gemini-2.5-flash-lite",
@@ -317,6 +327,9 @@ def guardrail_output_node(state: AgentState):
     if action == "MODIFIED" and revised:
         print(f"    ⚠️ MODIFIED: Response was adjusted by guardrail")
         from langchain_core.messages import AIMessage
+        followup_question = _structured_followup_question_for_slot(state.get("pending_slot"))
+        if followup_question:
+            revised = _append_structured_followup(str(revised), followup_question)
         new_message = AIMessage(content=revised, id=state["messages"][-1].id)
         
         # ส่งกลับไปให้ LangGraph ทำการ Overwrite ข้อความเดิมตาม ID เอง
@@ -387,7 +400,9 @@ def lab_prompt(context: str, summary_context: str) -> str:
         "- สรุปเป็นการวินิจฉัยโรค\n"
         "- ตอบยาวเกิน 10 ประโยค\n\n"
         "ถ้าข้อมูลไม่พอ:\n"
-        "ให้ตอบเท่าที่บอกได้ก่อน แล้วค่อยถามข้อมูลเพิ่มเติมที่จำเป็นตามเคสท้ายคำตอบ ไม่ถามข้อมูลที่ไม่เกี่ยว เช่น ไม่ถามงดอาหารในเคส eGFR/ยา/ไตที่ไม่ต้องใช้บริบทนี้\n"
+        "ให้ตอบเท่าที่บอกได้ก่อน แต่ห้ามถามอายุ เพศ หรืองดอาหารเองในคำตอบ "
+        "เพราะระบบจะเติมคำถาม follow-up แบบคงที่ให้หลังคำตอบโดยอัตโนมัติ "
+        "ไม่ถามข้อมูลที่ไม่เกี่ยว เช่น ไม่ถามงดอาหารในเคส eGFR/ยา/ไตที่ไม่ต้องใช้บริบทนี้\n"
     )
  
 def no_context_prompt() -> str:
@@ -431,6 +446,46 @@ def _analysis_retrieval_query(state: AgentState, fallback_query: str) -> str:
     return " ".join(str(part) for part in query_parts if part)
 
 
+def _structured_followup_question_for_slot(pending_slot: Optional[str]) -> Optional[str]:
+    if pending_slot == "gender":
+        return (
+            "เพศของผู้ที่เป็นเจ้าของผลตรวจคือชายหรือหญิงครับ? "
+            "ข้อมูลนี้ช่วยให้เทียบช่วงอ้างอิงได้เหมาะสมขึ้น"
+        )
+
+    if pending_slot == "age":
+        return "ผู้ที่เป็นเจ้าของผลตรวจอายุเท่าไรครับ?"
+
+    if pending_slot == "fasting_status":
+        return "ผลเลือดชุดนี้ตรวจหลังงดอาหารหรือไม่ครับ? กรุณาตอบว่าใช่หรือไม่ใช่"
+
+    return None
+
+
+def _next_structured_followup(state: AgentState) -> Tuple[Optional[str], Optional[str]]:
+    labs = state.get("extracted_lab_values") or {}
+    if not labs or state.get("pending_slot"):
+        return None, None
+
+    if state.get("gender") is None:
+        return "gender", _structured_followup_question_for_slot("gender")
+
+    if state.get("age") is None:
+        return "age", _structured_followup_question_for_slot("age")
+
+    if state.get("fasting_status") is None and any(name in FASTING_FOLLOWUP_LABS for name in labs):
+        return "fasting_status", _structured_followup_question_for_slot("fasting_status")
+
+    return None, None
+
+
+def _append_structured_followup(content: str, followup_question: str) -> str:
+    trimmed_content = content.rstrip()
+    if followup_question in trimmed_content:
+        return trimmed_content
+    return f"{trimmed_content}\n\n{followup_question}"
+
+
 def call_model(state: AgentState):
     """
     Node สำหรับตอบคำถาม: ดึง Context มาใส่ใน Prompt จริงๆ
@@ -457,11 +512,22 @@ def call_model(state: AgentState):
     # 3. ส่งคำสั่งที่มี "ข้อมูลอ้างอิง (Context)" ไปให้ Gemini
     print(f"[2] >>> AGENT NODE: Generating response...")
     response = chat_model.invoke([SystemMessage(content=system_prompt)] + messages)
+    pending_slot, followup_question = _next_structured_followup(state)
+    if pending_slot and followup_question:
+        updated_content = _append_structured_followup(str(response.content), followup_question)
+        if hasattr(response, "model_copy"):
+            response = response.model_copy(update={"content": updated_content})
+        else:
+            response = response.copy(update={"content": updated_content})
     
-    return {
+    result = {
         "messages": [response], 
         "steps": state.get("steps", []) + ["retrieval", "generate"]
     }
+    if pending_slot:
+        result["pending_slot"] = pending_slot
+
+    return result
 
 # ----- Generate graph -----
 def build_graph():
