@@ -45,7 +45,7 @@ Health Chatbot เป็น backend chatbot ภาษาไทยสำหรั
 flowchart LR
     user["ผู้ใช้ / OpenWebUI"] --> api["FastAPI Backend<br/>/v1/chat/completions"]
     api --> health_graph["LangGraph Health Agent"]
-    health_graph --> llm_extract["Gemini Extractor<br/>slot filling"]
+    health_graph --> intake["Deterministic Intake<br/>lab/profile slot rules"]
     health_graph --> rag["RAG Retrieval<br/>Chroma + HuggingFace Embeddings"]
     health_graph --> llm_answer["Gemini Chat Model<br/>medical response"]
     health_graph --> guard["Input/Output Guardrails"]
@@ -60,17 +60,30 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph backend["backend/main.py"]
-        models["GET /v1/models"]
-        chat["POST /v1/chat/completions"]
-        sim_page["GET /eval/simulator"]
-        sim_cases["GET /eval/simulator/cases"]
-        sim_stream["GET /eval/simulator/stream/{case_id}"]
-        memory["slot_memory_store<br/>per conversation"]
+    subgraph backend["backend/"]
+        main["main.py<br/>FastAPI app wiring"]
+        chat_route["routes/chat.py<br/>OpenAI-compatible API"]
+        eval_route["routes/eval.py<br/>Eval simulator API"]
+        schemas["schemas.py<br/>request models"]
+        compat["openai_compat.py<br/>response helpers"]
+        deps["dependencies.py<br/>lazy graph/model loading"]
+        eval_ui["eval_ui.py<br/>simulator HTML"]
+    end
+
+    subgraph services["services/"]
+        chat_service["health_chat_service.py<br/>slot memory + graph invocation"]
+        eval_service["eval_service.py<br/>patient simulator + judge"]
     end
 
     subgraph agent["agent/"]
-        graph_py["graph.py<br/>main LangGraph"]
+        graph_py["graph.py<br/>LangGraph assembly"]
+        models["models.py<br/>Vertex model setup"]
+        memory["memory.py<br/>input + summary nodes"]
+        guardrails["guardrails.py<br/>input/output safety nodes"]
+        analyst["analyst.py<br/>RAG answer node"]
+        prompts["prompts.py<br/>system prompts"]
+        followups["followups.py<br/>structured follow-up helpers"]
+        tools["tools.py<br/>tool registry"]
         slots["slot_filling_graph.py<br/>slot extraction + routing"]
         state["state.py<br/>AgentState"]
         rag_utils["rag_utils.py<br/>retrieve_context"]
@@ -81,15 +94,30 @@ flowchart TB
         criteria["judge_criteria.json<br/>rubric + checkpoint schema"]
     end
 
-    chat --> memory
-    chat --> graph_py
+    main --> chat_route
+    main --> eval_route
+    chat_route --> schemas
+    chat_route --> compat
+    chat_route --> chat_service
+    chat_route --> eval_service
+    eval_route --> eval_ui
+    eval_route --> eval_service
+    chat_service --> deps
+    eval_service --> deps
+    deps --> graph_py
+    graph_py --> models
+    graph_py --> memory
+    graph_py --> guardrails
+    graph_py --> analyst
+    graph_py --> tools
     graph_py --> slots
-    graph_py --> rag_utils
     graph_py --> state
-    sim_page --> sim_cases
-    sim_stream --> cases
-    sim_stream --> graph_py
-    sim_stream --> criteria
+    analyst --> rag_utils
+    analyst --> prompts
+    analyst --> followups
+    guardrails --> followups
+    eval_service --> cases
+    eval_service --> criteria
 ```
 
 ### Main Chat Request Flow
@@ -186,7 +214,7 @@ eGFR 68 ไตไม่ดีหรือเปล่า
 
 ## Agent Flow
 
-LangGraph หลักอยู่ที่ `agent/graph.py`
+LangGraph assembly หลักอยู่ที่ `agent/graph.py` ส่วน node/prompt/model ถูกแยกไว้ตาม responsibility ในไฟล์ย่อยของ `agent/`
 
 ```mermaid
 flowchart TD
@@ -256,7 +284,7 @@ flowchart LR
     processed --> embed["HuggingFace Embeddings<br/>paraphrase-multilingual-MiniLM-L12-v2"]
     embed --> chroma[("data/chroma_db_health<br/>Chroma vector DB")]
     chroma --> retrieve["agent/rag_utils.py<br/>retrieve_context(query)"]
-    retrieve --> prompt["agent/graph.py<br/>lab_prompt(context, summary)"]
+    retrieve --> prompt["agent/prompts.py<br/>lab_prompt(context, summary)"]
 ```
 
 ### Knowledge Sources
@@ -428,13 +456,61 @@ fatal_error = false, pass = true
 
 ```text
 backend/main.py
-  FastAPI app, OpenAI-compatible API, OpenWebUI integration, eval simulator, LLM judge
+  FastAPI app wiring, CORS, route registration
+
+backend/routes/chat.py
+  OpenAI-compatible chat and model-list endpoints
+
+backend/routes/eval.py
+  Eval simulator page/cases/stream endpoints
+
+backend/schemas.py
+  OpenAI-compatible request schemas
+
+backend/openai_compat.py
+  OpenAI-compatible response and streaming helpers
+
+backend/dependencies.py
+  Lazy loading for LangGraph app and chat model
+
+backend/eval_ui.py
+  HTML page for local eval simulator
+
+services/health_chat_service.py
+  OpenWebUI integration, slot memory, fast-path slot handling, graph invocation
+
+services/eval_service.py
+  Patient simulator, eval runner, LLM judge, SSE/OpenWebUI simulation output
 
 agent/graph.py
-  LangGraph หลัก, guardrails, RAG answer node, output safety review, summary memory
+  LangGraph assembly and routing between nodes
+
+agent/models.py
+  Vertex AI credential setup and shared chat/intent models
+
+agent/memory.py
+  Input node and summary memory node
+
+agent/guardrails.py
+  Input relevance guardrail, output safety review, deterministic fast paths
+
+agent/analyst.py
+  RAG retrieval query construction and main answer generation node
+
+agent/prompts.py
+  Core identity, lab analysis prompt, no-context prompt
+
+agent/followups.py
+  Structured follow-up question helpers for pending slots
+
+agent/tools.py
+  Tool registry for LangGraph ToolNode
 
 agent/slot_filling_graph.py
-  Slot extraction, lab aliases, intent classification, routing logic, question nodes
+  Deterministic intake routing and fixed question nodes
+
+agent/intake.py
+  Rule-based lab/profile parser, intent classification, missing-info rules
 
 agent/state.py
   AgentState schema
@@ -543,12 +619,9 @@ http://127.0.0.1:8000/eval/simulator
 | `GCP_CREDS_JSON` | unset | JSON service account สำหรับ deploy environment |
 | `GOOGLE_APPLICATION_CREDENTIALS` | unset | path ไปยัง Google credential file |
 | `GOOGLE_CLOUD_PROJECT` | จาก credential | GCP project id |
-| `SLOT_FILLING_LLM_PROVIDER` | `vertex` | provider สำหรับ extraction model: `vertex` หรือ `google_genai` |
-| `SLOT_FILLING_MODEL` | `gemini-2.5-flash-lite` | model สำหรับ slot extraction |
+โมเดลหลักใน `agent/models.py`:
 
-โมเดลหลักใน `agent/graph.py`:
-
-- Intent/guard/extraction บางส่วนใช้ `gemini-2.5-flash-lite`
+- Summary/guard helper บางส่วนใช้ `gemini-2.5-flash-lite`
 - Chat response ใช้ `gemini-2.5-flash`
 
 ## API Endpoints
@@ -657,7 +730,15 @@ SSE stream สำหรับ simulation:
 ### Syntax checks
 
 ```bash
-python3 -m py_compile backend/main.py agent/slot_filling_graph.py agent/graph.py agent/state.py
+python3 -m py_compile \
+  backend/main.py backend/routes/chat.py backend/routes/eval.py \
+  backend/settings.py backend/schemas.py backend/openai_compat.py \
+  backend/dependencies.py backend/eval_ui.py \
+  services/health_chat_service.py services/eval_service.py \
+  agent/graph.py agent/models.py agent/memory.py agent/guardrails.py \
+  agent/analyst.py agent/prompts.py agent/followups.py agent/tools.py \
+  agent/constants.py agent/intake.py agent/slot_filling_graph.py \
+  agent/state.py agent/rag_utils.py
 ```
 
 ### JSON validation
@@ -700,9 +781,9 @@ our_agent
 ## Known Limitations
 
 - RAG ครอบคลุมเฉพาะ domain ที่มีเอกสารใน `data/` ยังไม่ใช่ฐานความรู้แพทย์ทั่วไปทั้งหมด
-- Slot extraction ยังพึ่ง LLM เป็นหลัก แม้มี deterministic normalizer ช่วยบางส่วน
+- Free-text intake ใช้ rule-based parser เป็นหลัก จึงยังควรเพิ่ม alias/pattern เมื่อเจอรูปแบบผลตรวจใหม่
 - Vector DB path ใน `agent/rag_utils.py` ใช้ `data/chroma_db_health` แต่ใน workspace อาจมี `chroma_db_health` ที่ root ด้วย ควรตรวจให้ตรงกันก่อน deploy จริง
-- Output guardrail เป็น LLM-based จึงควรมี deterministic checks เพิ่มในอนาคตสำหรับ fatal patterns สำคัญ
+- Output guardrail มี deterministic skip สำหรับคำตอบ low-risk และใช้ LLM review เฉพาะ risky intents/patterns สำคัญ
 - Eval simulator เป็นตัวช่วยทดสอบ trajectory ไม่ใช่ clinical benchmark ที่ใช้แทน expert review ได้
 
 ## Development Notes
@@ -713,6 +794,14 @@ our_agent
 
 ```bash
 uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-python3 -m py_compile backend/main.py agent/slot_filling_graph.py agent/graph.py agent/state.py
+python3 -m py_compile \
+  backend/main.py backend/routes/chat.py backend/routes/eval.py \
+  backend/settings.py backend/schemas.py backend/openai_compat.py \
+  backend/dependencies.py backend/eval_ui.py \
+  services/health_chat_service.py services/eval_service.py \
+  agent/graph.py agent/models.py agent/memory.py agent/guardrails.py \
+  agent/analyst.py agent/prompts.py agent/followups.py agent/tools.py \
+  agent/constants.py agent/intake.py agent/slot_filling_graph.py \
+  agent/state.py agent/rag_utils.py
 python3 -m json.tool eval/user_simulation_cases.json > /dev/null
 ```
