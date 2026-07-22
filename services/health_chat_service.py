@@ -293,8 +293,25 @@ def log_openwebui_request(req: ChatRequest, *, is_webui_task: bool) -> None:
     print(f"[TEMP_OPENWEBUI_LOG] selected_memory_key={conversation_key(req)!r}")
 
 
-def initial_slot_state(conversation_key_value: str) -> dict[str, Any]:
+def _request_health_state(req: ChatRequest) -> dict[str, Any]:
+    if isinstance(req.health_state, dict):
+        return req.health_state
+
+    metadata = req.metadata or {}
+    metadata_state = metadata.get("health_state")
+    if isinstance(metadata_state, dict):
+        return metadata_state
+
+    return {}
+
+
+def initial_slot_state(
+    conversation_key_value: str,
+    request_state: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     saved_slots = slot_memory_store.get(conversation_key_value, {})
+    if request_state:
+        saved_slots = {**saved_slots, **request_state}
     return {field_name: saved_slots.get(field_name) for field_name in SLOT_FIELD_NAMES}
 
 
@@ -305,6 +322,19 @@ def save_slot_state(conversation_key_value: str, graph_result: dict[str, Any]) -
             current_slots[field_name] = graph_result.get(field_name)
     if "summary" in graph_result:
         current_slots["summary"] = graph_result.get("summary") or ""
+
+
+def health_state_snapshot(conversation_key_value: str) -> dict[str, Any]:
+    current_slots = slot_memory_store.get(conversation_key_value, {})
+    snapshot = {
+        field_name: current_slots.get(field_name)
+        for field_name in SLOT_FIELD_NAMES
+        if current_slots.get(field_name) is not None
+    }
+    summary = current_slots.get("summary")
+    if summary:
+        snapshot["summary"] = summary
+    return snapshot
 
 
 def needs_fasting_followup(slot_state: dict[str, Any]) -> bool:
@@ -423,6 +453,17 @@ def slot_response_metadata(graph_result: dict[str, Any]) -> Optional[dict[str, A
     return metadata
 
 
+def response_metadata(
+    conversation_key_value: str,
+    graph_result: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    metadata = slot_response_metadata(graph_result) or {}
+    health_state = health_state_snapshot(conversation_key_value)
+    if health_state:
+        metadata["health_state"] = health_state
+    return metadata or None
+
+
 def run_chat_completion(
     req: ChatRequest,
     converted_messages: list[HumanMessage | AIMessage | SystemMessage],
@@ -450,10 +491,20 @@ def run_chat_completion(
 
     print("\n[Interceptor] Normal user message detected. Routing to LangGraph.")
     conversation_key_value = conversation_key(req)
+    request_state = _request_health_state(req)
+    if request_state:
+        slot_memory_store[conversation_key_value] = {
+            **slot_memory_store.get(conversation_key_value, {}),
+            **request_state,
+        }
     fast_response = pending_slot_fast_response(conversation_key_value, latest_user_message)
     if fast_response:
-        assistant_content, response_metadata = fast_response
-        return assistant_content, usage_data, response_metadata
+        assistant_content, fast_metadata = fast_response
+        metadata = fast_metadata or {}
+        health_state = health_state_snapshot(conversation_key_value)
+        if health_state:
+            metadata["health_state"] = health_state
+        return assistant_content, usage_data, metadata or None
 
     windowed_messages, summary = _prepare_windowed_messages_and_summary(
         conversation_key_value,
@@ -466,7 +517,7 @@ def run_chat_completion(
         "steps": [],
         "current_node": "",
         "intent": None,
-        **initial_slot_state(conversation_key_value),
+        **initial_slot_state(conversation_key_value, request_state),
         "summary": summary,
     })
     save_slot_state(conversation_key_value, result)
@@ -479,4 +530,4 @@ def run_chat_completion(
     usage_data["completion_tokens"] = meta.get("output_tokens", 0)
     usage_data["total_tokens"] = meta.get("total_tokens", 0)
 
-    return assistant_content, usage_data, slot_response_metadata(result)
+    return assistant_content, usage_data, response_metadata(conversation_key_value, result)
