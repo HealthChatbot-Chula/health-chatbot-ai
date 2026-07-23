@@ -1,4 +1,4 @@
-from typing import Annotated, Dict, List, Optional, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
@@ -25,3 +25,7 @@ class AgentState(TypedDict, total=False):
     fasting_status: Optional[str]  # "yes" or "no"
     extracted_lab_values: Optional[Dict[str, float]]
     pending_slot: Optional[str]
+
+    # Structured payloads passed by the frontend/OpenWebUI adapter.
+    health_state: Optional[Dict[str, Any]]
+    profile_metrics: Optional[Any]

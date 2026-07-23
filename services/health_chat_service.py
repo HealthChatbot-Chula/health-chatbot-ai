@@ -11,6 +11,8 @@ from agent.llm_timing import timed_llm_invoke
 
 
 SLOT_FIELD_NAMES = (
+    "health_state",
+    "profile_metrics",
     "age",
     "gender",
     "underlying_disease",
@@ -294,15 +296,150 @@ def log_openwebui_request(req: ChatRequest, *, is_webui_task: bool) -> None:
 
 
 def _request_health_state(req: ChatRequest) -> dict[str, Any]:
+    raw_state: dict[str, Any] = {}
     if isinstance(req.health_state, dict):
-        return req.health_state
+        raw_state.update(req.health_state)
 
     metadata = req.metadata or {}
     metadata_state = metadata.get("health_state")
     if isinstance(metadata_state, dict):
-        return metadata_state
+        raw_state.update(metadata_state)
+
+    extra_fields = request_extra_fields(req)
+    for key in ("profile_metrics", "health_state"):
+        value = extra_fields.get(key)
+        if isinstance(value, dict) and key == "health_state":
+            raw_state.update(value)
+        elif value is not None:
+            raw_state[key] = value
+
+    metadata_metrics = metadata.get("profile_metrics")
+    if metadata_metrics is not None and "profile_metrics" not in raw_state:
+        raw_state["profile_metrics"] = metadata_metrics
+
+    return _normalized_request_state(raw_state)
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _dict_at(value: Any, *keys: str) -> dict[str, Any]:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, dict) else {}
+
+
+def _metrics_to_lab_values(metrics: Any) -> dict[str, Any]:
+    if not metrics:
+        return {}
+
+    if isinstance(metrics, dict):
+        lab_values: dict[str, Any] = {}
+        for key, value in metrics.items():
+            if isinstance(value, dict):
+                lab_values[key] = _first_present(
+                    value.get("value"),
+                    value.get("result"),
+                    value.get("numeric_value"),
+                    value.get("measurement"),
+                )
+            else:
+                lab_values[key] = value
+        return lab_values
+
+    if isinstance(metrics, list):
+        lab_values = {}
+        for item in metrics:
+            if not isinstance(item, dict):
+                continue
+            name = _first_present(
+                item.get("name"),
+                item.get("key"),
+                item.get("label"),
+                item.get("metric"),
+                item.get("code"),
+            )
+            value = _first_present(
+                item.get("value"),
+                item.get("result"),
+                item.get("numeric_value"),
+                item.get("measurement"),
+            )
+            if name is not None and value is not None:
+                lab_values[str(name)] = value
+        return lab_values
 
     return {}
+
+
+def _normalized_request_state(raw_state: dict[str, Any]) -> dict[str, Any]:
+    if not raw_state:
+        return {}
+
+    from agent.intake import (
+        merge_lab_values,
+        normalize_age,
+        normalize_gender,
+        normalize_lab_values,
+        normalize_yes_no,
+    )
+
+    profile = _dict_at(raw_state, "profile") or _dict_at(raw_state, "patient_profile")
+    demographics = _dict_at(raw_state, "demographics")
+    profile_metrics = _first_present(
+        raw_state.get("profile_metrics"),
+        raw_state.get("metrics"),
+        raw_state.get("lab_values"),
+        raw_state.get("labs"),
+        raw_state.get("extracted_lab_values"),
+    )
+
+    normalized: dict[str, Any] = {
+        "health_state": raw_state,
+    }
+    if profile_metrics is not None:
+        normalized["profile_metrics"] = profile_metrics
+
+    age = normalize_age(_first_present(raw_state.get("age"), profile.get("age"), demographics.get("age")))
+    if age is not None:
+        normalized["age"] = age
+
+    gender = normalize_gender(
+        _first_present(raw_state.get("gender"), profile.get("gender"), demographics.get("gender"))
+    )
+    if gender is not None:
+        normalized["gender"] = gender
+
+    fasting_status = normalize_yes_no(
+        _first_present(
+            raw_state.get("fasting_status"),
+            raw_state.get("fasting"),
+            raw_state.get("is_fasting"),
+        )
+    )
+    if fasting_status is not None:
+        normalized["fasting_status"] = fasting_status
+
+    direct_labs = normalize_lab_values(raw_state.get("extracted_lab_values"))
+    metric_labs = normalize_lab_values(_metrics_to_lab_values(profile_metrics))
+    labs = merge_lab_values(direct_labs, metric_labs)
+    if labs:
+        normalized["extracted_lab_values"] = labs
+        if raw_state.get("pending_slot") == "extracted_lab_values":
+            normalized["pending_slot"] = None
+
+    for field_name in ("underlying_disease", "current_medications", "current_symptoms", "pending_slot"):
+        if field_name in raw_state and raw_state.get(field_name) is not None:
+            normalized[field_name] = raw_state.get(field_name)
+
+    return normalized
 
 
 def initial_slot_state(

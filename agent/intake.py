@@ -31,6 +31,14 @@ LAB_ALIASES = {
     "bun": "BUN",
     "ast": "AST",
     "alt": "ALT",
+    "sbp": "SBP",
+    "systolic": "SBP",
+    "ความดันตัวบน": "SBP",
+    "ตัวบน": "SBP",
+    "dbp": "DBP",
+    "diastolic": "DBP",
+    "ความดันตัวล่าง": "DBP",
+    "ตัวล่าง": "DBP",
 }
 
 LAB_VALUE_PATTERNS = (
