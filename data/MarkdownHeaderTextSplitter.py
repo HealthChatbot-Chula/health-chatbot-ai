@@ -195,10 +195,14 @@ def build_vector_db(processed_files: list[Path]) -> None:
 
 
 def main():
-    processed_files = build_processed_markdown()
+    processed_files = [
+        PROCESSED_DIR / filename
+        for filename in FILES
+        if (PROCESSED_DIR / filename).exists()
+    ]
 
     if not processed_files:
-        raise RuntimeError("No markdown files were processed.")
+        raise RuntimeError("No processed markdown files were found.")
 
     build_vector_db(processed_files)
 
