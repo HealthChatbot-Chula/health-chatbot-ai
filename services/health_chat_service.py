@@ -11,7 +11,6 @@ from agent.llm_timing import timed_llm_invoke
 
 
 SLOT_FIELD_NAMES = (
-    "health_state",
     "profile_metrics",
     "age",
     "gender",
@@ -92,6 +91,24 @@ def _split_history_window(
     return (
         system_messages + chat_messages[-max_window_messages:],
         chat_messages[:-max_window_messages],
+    )
+
+
+def _has_authoritative_profile_state(request_state: dict[str, Any]) -> bool:
+    return bool(
+        request_state.get("profile_metrics")
+        or request_state.get("extracted_lab_values")
+    )
+
+
+def _authoritative_profile_instruction() -> str:
+    return (
+        "\n\nข้อกำหนดสำคัญเกี่ยวกับข้อมูลสุขภาพปัจจุบัน:"
+        "\n- ค่าใน structured data ด้านล่างคือข้อมูลล่าสุดที่ผู้ใช้ยืนยัน/บันทึกใน profile"
+        "\n- ถ้า summary หรือประวัติแชทมีค่าผลตรวจ/ความดันที่ขัดกับ structured data "
+        "ให้ถือว่า summary/ประวัติเป็นข้อมูลเก่า"
+        "\n- ใช้ summary และประวัติแชทเพื่อเข้าใจเจตนา/บริบทการถามเท่านั้น "
+        "ห้ามใช้ค่าตัวเลขเก่าแทนค่าจาก structured data ล่าสุด"
     )
 
 
@@ -401,9 +418,7 @@ def _normalized_request_state(raw_state: dict[str, Any]) -> dict[str, Any]:
         raw_state.get("extracted_lab_values"),
     )
 
-    normalized: dict[str, Any] = {
-        "health_state": raw_state,
-    }
+    normalized: dict[str, Any] = {}
     if profile_metrics is not None:
         normalized["profile_metrics"] = profile_metrics
 
@@ -647,6 +662,8 @@ def run_chat_completion(
         conversation_key_value,
         converted_messages,
     )
+    if _has_authoritative_profile_state(request_state):
+        summary = f"{summary}{_authoritative_profile_instruction()}"
 
     graph, _ = load_agent_resources()
     result = graph.invoke({
