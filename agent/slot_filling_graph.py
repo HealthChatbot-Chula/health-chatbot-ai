@@ -202,17 +202,16 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
 
 
 def route_after_extraction(state: AgentState) -> str:
-    """Route to the first missing critical slot, in priority order."""
+    """Route after extraction without blocking answers on optional profile slots."""
 
     next_slot = next_required_slot(state)
     if next_slot == "extracted_lab_values":
+        if state.get("intent") not in {"lab_interpretation", "general_info"}:
+            return "our_agent"
         return "ask_lab_node"
-    if next_slot == "age":
-        return "ask_age_node"
-    if next_slot == "gender":
-        return "ask_gender_node"
-    if next_slot == "fasting_status":
-        return "ask_fasting_node"
+
+    # Once lab/profile data is available, answer the primary question first.
+    # Age, gender, and fasting status are collected by the analyst follow-up.
     return "our_agent"
 
 

@@ -11,6 +11,8 @@ from agent.llm_timing import timed_llm_invoke
 
 
 SLOT_FIELD_NAMES = (
+    "health_state",
+    "profile_metrics",
     "age",
     "gender",
     "underlying_disease",
@@ -239,6 +241,188 @@ def request_extra_fields(req: ChatRequest) -> dict[str, Any]:
     }
 
 
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _dict_at(value: Any, *keys: str) -> dict[str, Any]:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, dict) else {}
+
+
+def _metrics_to_lab_values(metrics: Any) -> dict[str, Any]:
+    if not metrics:
+        return {}
+
+    if isinstance(metrics, dict):
+        lab_values: dict[str, Any] = {}
+        for key, value in metrics.items():
+            if isinstance(value, dict):
+                lab_values[key] = _first_present(
+                    value.get("value"),
+                    value.get("result"),
+                    value.get("numeric_value"),
+                    value.get("measurement"),
+                )
+            else:
+                lab_values[key] = value
+        return lab_values
+
+    if isinstance(metrics, list):
+        lab_values = {}
+        for item in metrics:
+            if not isinstance(item, dict):
+                continue
+            name = _first_present(
+                item.get("name"),
+                item.get("key"),
+                item.get("label"),
+                item.get("metric"),
+                item.get("code"),
+            )
+            value = _first_present(
+                item.get("value"),
+                item.get("result"),
+                item.get("numeric_value"),
+                item.get("measurement"),
+            )
+            if name is not None and value is not None:
+                lab_values[str(name)] = value
+        return lab_values
+
+    return {}
+
+
+def _normalized_request_state(raw_state: dict[str, Any]) -> dict[str, Any]:
+    if not raw_state:
+        return {}
+
+    from agent.intake import (
+        merge_lab_values,
+        normalize_age,
+        normalize_gender,
+        normalize_lab_values,
+        normalize_yes_no,
+    )
+
+    profile = _dict_at(raw_state, "profile") or _dict_at(raw_state, "patient_profile")
+    demographics = _dict_at(raw_state, "demographics")
+    profile_metrics = _first_present(
+        raw_state.get("profile_metrics"),
+        raw_state.get("metrics"),
+        raw_state.get("lab_values"),
+        raw_state.get("labs"),
+        raw_state.get("extracted_lab_values"),
+    )
+    lab_source_supplied = any(
+        key in raw_state
+        for key in (
+            "profile_metrics",
+            "metrics",
+            "lab_values",
+            "labs",
+            "extracted_lab_values",
+        )
+    )
+
+    normalized: dict[str, Any] = {"health_state": raw_state}
+    if profile_metrics is not None:
+        normalized["profile_metrics"] = profile_metrics
+
+    age = normalize_age(_first_present(raw_state.get("age"), profile.get("age"), demographics.get("age")))
+    if age is not None:
+        normalized["age"] = age
+
+    gender = normalize_gender(
+        _first_present(raw_state.get("gender"), profile.get("gender"), demographics.get("gender"))
+    )
+    if gender is not None:
+        normalized["gender"] = gender
+
+    fasting_status = normalize_yes_no(
+        _first_present(
+            raw_state.get("fasting_status"),
+            raw_state.get("fasting"),
+            raw_state.get("is_fasting"),
+        )
+    )
+    if fasting_status is not None:
+        normalized["fasting_status"] = fasting_status
+
+    direct_labs = normalize_lab_values(raw_state.get("extracted_lab_values"))
+    metric_labs = normalize_lab_values(_metrics_to_lab_values(profile_metrics))
+    labs = merge_lab_values(direct_labs, metric_labs)
+    if labs:
+        normalized["extracted_lab_values"] = labs
+        normalized["pending_slot"] = None
+    elif lab_source_supplied:
+        normalized["extracted_lab_values"] = {}
+        normalized["pending_slot"] = None
+
+    copied_fields = ("underlying_disease", "current_medications", "current_symptoms")
+    if "extracted_lab_values" not in normalized:
+        copied_fields = (*copied_fields, "pending_slot")
+
+    for field_name in copied_fields:
+        if field_name in raw_state and raw_state.get(field_name) is not None:
+            normalized[field_name] = raw_state.get(field_name)
+
+    return normalized
+
+
+def _request_health_state(req: ChatRequest) -> dict[str, Any]:
+    raw_state: dict[str, Any] = {}
+    if isinstance(req.health_state, dict):
+        raw_state.update(req.health_state)
+
+    metadata = req.metadata or {}
+    metadata_state = metadata.get("health_state")
+    if isinstance(metadata_state, dict):
+        raw_state.update(metadata_state)
+
+    for key in ("profile_metrics", "lab_values", "extracted_lab_values"):
+        value = getattr(req, key, None)
+        if value is not None:
+            raw_state[key] = value
+
+    extra_fields = request_extra_fields(req)
+    for key in ("profile_metrics", "lab_values", "labs", "extracted_lab_values", "health_state"):
+        value = extra_fields.get(key)
+        if isinstance(value, dict) and key == "health_state":
+            raw_state.update(value)
+        elif value is not None:
+            raw_state[key] = value
+
+    for key in ("profile_metrics", "lab_values", "labs", "extracted_lab_values"):
+        value = metadata.get(key)
+        if value is not None and key not in raw_state:
+            raw_state[key] = value
+
+    return _normalized_request_state(raw_state)
+
+
+def _has_authoritative_profile_state(request_state: dict[str, Any]) -> bool:
+    return "profile_metrics" in request_state or "extracted_lab_values" in request_state
+
+
+def _authoritative_profile_instruction() -> str:
+    return (
+        "\n\nข้อกำหนดสำคัญเกี่ยวกับข้อมูลสุขภาพปัจจุบัน:"
+        "\n- ค่าใน structured data ด้านล่างคือข้อมูลล่าสุดที่ผู้ใช้ยืนยัน/บันทึกใน profile หรือ form"
+        "\n- ถ้า summary หรือประวัติแชทมีค่าผลตรวจ/ความดันที่ขัดกับ structured data "
+        "ให้ถือว่า summary/ประวัติเป็นข้อมูลเก่า"
+        "\n- ใช้ summary และประวัติแชทเพื่อเข้าใจเจตนา/บริบทการถามเท่านั้น "
+        "ห้ามใช้ค่าตัวเลขเก่าแทนค่าจาก structured data ล่าสุด"
+    )
+
+
 def preview_text(text: str, limit: int = 80) -> str:
     compact = " ".join(text.split())
     if len(compact) <= limit:
@@ -293,8 +477,13 @@ def log_openwebui_request(req: ChatRequest, *, is_webui_task: bool) -> None:
     print(f"[TEMP_OPENWEBUI_LOG] selected_memory_key={conversation_key(req)!r}")
 
 
-def initial_slot_state(conversation_key_value: str) -> dict[str, Any]:
+def initial_slot_state(
+    conversation_key_value: str,
+    request_state: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     saved_slots = slot_memory_store.get(conversation_key_value, {})
+    if request_state:
+        saved_slots = {**saved_slots, **request_state}
     return {field_name: saved_slots.get(field_name) for field_name in SLOT_FIELD_NAMES}
 
 
@@ -305,6 +494,19 @@ def save_slot_state(conversation_key_value: str, graph_result: dict[str, Any]) -
             current_slots[field_name] = graph_result.get(field_name)
     if "summary" in graph_result:
         current_slots["summary"] = graph_result.get("summary") or ""
+
+
+def health_state_snapshot(conversation_key_value: str) -> dict[str, Any]:
+    current_slots = slot_memory_store.get(conversation_key_value, {})
+    snapshot = {
+        field_name: current_slots.get(field_name)
+        for field_name in SLOT_FIELD_NAMES
+        if current_slots.get(field_name) is not None
+    }
+    summary = current_slots.get("summary")
+    if summary:
+        snapshot["summary"] = summary
+    return snapshot
 
 
 def needs_fasting_followup(slot_state: dict[str, Any]) -> bool:
@@ -450,15 +652,30 @@ def run_chat_completion(
 
     print("\n[Interceptor] Normal user message detected. Routing to LangGraph.")
     conversation_key_value = conversation_key(req)
+    request_state = _request_health_state(req)
+    if request_state:
+        slot_memory_store[conversation_key_value] = {
+            **slot_memory_store.get(conversation_key_value, {}),
+            **request_state,
+        }
+        if _has_authoritative_profile_state(request_state):
+            slot_memory_store[conversation_key_value]["pending_slot"] = None
+
     fast_response = pending_slot_fast_response(conversation_key_value, latest_user_message)
     if fast_response:
         assistant_content, response_metadata = fast_response
-        return assistant_content, usage_data, response_metadata
+        metadata = response_metadata or {}
+        health_state = health_state_snapshot(conversation_key_value)
+        if health_state:
+            metadata["health_state"] = health_state
+        return assistant_content, usage_data, metadata or None
 
     windowed_messages, summary = _prepare_windowed_messages_and_summary(
         conversation_key_value,
         converted_messages,
     )
+    if _has_authoritative_profile_state(request_state):
+        summary = f"{summary}{_authoritative_profile_instruction()}"
 
     graph, _ = load_agent_resources()
     result = graph.invoke({
@@ -466,7 +683,7 @@ def run_chat_completion(
         "steps": [],
         "current_node": "",
         "intent": None,
-        **initial_slot_state(conversation_key_value),
+        **initial_slot_state(conversation_key_value, request_state),
         "summary": summary,
     })
     save_slot_state(conversation_key_value, result)
@@ -479,4 +696,8 @@ def run_chat_completion(
     usage_data["completion_tokens"] = meta.get("output_tokens", 0)
     usage_data["total_tokens"] = meta.get("total_tokens", 0)
 
-    return assistant_content, usage_data, slot_response_metadata(result)
+    metadata = slot_response_metadata(result) or {}
+    health_state = health_state_snapshot(conversation_key_value)
+    if health_state:
+        metadata["health_state"] = health_state
+    return assistant_content, usage_data, metadata or None

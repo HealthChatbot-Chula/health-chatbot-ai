@@ -1,3 +1,6 @@
+import json
+from typing import Any
+
 from langchain_core.messages import SystemMessage
 
 from .followups import _append_structured_followup, _next_structured_followup
@@ -11,6 +14,8 @@ from .state import AgentState
 def _analysis_slot_context(state: AgentState) -> str:
     labs = state.get("extracted_lab_values") or {}
     lab_text = ", ".join(f"{name}: {value}" for name, value in labs.items()) or "-"
+    profile_metrics = state.get("profile_metrics")
+    health_state = state.get("health_state")
     return (
         "\n\nข้อมูล structured ที่สกัดได้ก่อนวิเคราะห์:"
         f"\n- intent: {state.get('intent')}"
@@ -21,6 +26,23 @@ def _analysis_slot_context(state: AgentState) -> str:
         f"\n- current_medications: {state.get('current_medications')}"
         f"\n- current_symptoms: {state.get('current_symptoms')}"
         f"\n- extracted_lab_values: {lab_text}"
+        f"\n- profile_metrics: {_compact_json(profile_metrics) if profile_metrics else '-'}"
+        f"\n- health_state: {_compact_json(health_state) if health_state else '-'}"
+    )
+
+
+def _compact_json(value: Any, limit: int = 1200) -> str:
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) > limit:
+        return f"{text[:limit]}..."
+    return text
+
+
+def _has_structured_health_data(state: AgentState) -> bool:
+    return bool(
+        state.get("extracted_lab_values")
+        or state.get("profile_metrics")
+        or state.get("health_state")
     )
 
 
@@ -58,7 +80,15 @@ def call_model(state: AgentState):
     print("=== RETRIEVAL QUERY ===", retrieval_query)
     print("=== CONTEXT ===", context)
 
-    system_prompt = lab_prompt(context, summary_context) if context else no_context_prompt()
+    if context or _has_structured_health_data(state):
+        if not context:
+            context = (
+                "ไม่มีข้อมูลจาก RAG ที่ตรงพอในรอบนี้ ให้ใช้ข้อมูล structured "
+                "จากผู้ใช้ด้านบนเป็นหลัก และห้ามตอบว่าผู้ใช้ยังไม่ได้ให้ค่าผลตรวจ"
+            )
+        system_prompt = lab_prompt(context, summary_context)
+    else:
+        system_prompt = no_context_prompt()
 
     print("[2] >>> AGENT NODE: Generating response...")
     response = timed_llm_invoke(

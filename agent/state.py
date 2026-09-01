@@ -17,6 +17,8 @@ class AgentState(TypedDict, total=False):
     intent: Optional[str]
 
     # Slot-filling / medical checkup fields.
+    health_state: Optional[Dict[str, object]]
+    profile_metrics: Optional[object]
     age: Optional[int]
     gender: Optional[str]  # "male" or "female"
     underlying_disease: Optional[List[str]]

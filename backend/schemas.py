@@ -16,6 +16,10 @@ class ChatRequest(BaseModel):
     chat_id: Optional[str] = None
     session_id: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
+    health_state: Optional[dict[str, Any]] = None
+    profile_metrics: Optional[Any] = None
+    lab_values: Optional[Any] = None
+    extracted_lab_values: Optional[dict[str, Any]] = None
     stream: Optional[bool] = False
 
     class Config:
