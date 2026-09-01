@@ -204,6 +204,13 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
 def route_after_extraction(state: AgentState) -> str:
     """Route after extraction without blocking answers on optional profile slots."""
 
+    latest_user_message = _latest_user_text(state.get("messages", []))
+    if state.get("intent") == "general_info" and (
+        _looks_like_greeting(latest_user_message)
+        or _looks_like_scope_question(latest_user_message)
+    ):
+        return "ask_lab_node"
+
     next_slot = next_required_slot(state)
     if next_slot == "extracted_lab_values":
         if state.get("intent") not in {"lab_interpretation", "general_info"}:
@@ -219,6 +226,7 @@ def ask_lab_node(state: AgentState) -> Dict[str, Any]:
     messages = state.get("messages", [])
     latest_user_message = _latest_user_text(messages)
     topic_specific_question = _topic_specific_lab_question(state, messages)
+    labs = state.get("extracted_lab_values") or {}
 
     if topic_specific_question:
         content = topic_specific_question
@@ -233,19 +241,27 @@ def ask_lab_node(state: AgentState) -> Dict[str, Any]:
             f"{_intake_question_text()}"
         )
     elif _looks_like_greeting(latest_user_message):
-        content = (
-            "สวัสดีครับ ผมช่วยดูผลตรวจสุขภาพเบื้องต้นได้ครับ\n\n"
-            f"{_intake_question_text()}"
-        )
+        if labs:
+            content = (
+                "สวัสดีครับ ผมยังใช้ข้อมูลผลตรวจที่คุยกันไว้เป็นบริบทได้ครับ "
+                "ถ้าอยากให้ช่วยดูค่าล่าสุดหรือถามต่อจากผลตรวจเดิม ส่งคำถามมาได้เลยครับ"
+            )
+        else:
+            content = (
+                "สวัสดีครับ ผมช่วยดูผลตรวจสุขภาพเบื้องต้นได้ครับ\n\n"
+                f"{_intake_question_text()}"
+            )
     else:
         content = _intake_question_text()
 
-    return {
-        "pending_slot": "extracted_lab_values",
+    result: Dict[str, Any] = {
         "messages": [
             AIMessage(content=content)
         ]
     }
+    if not labs:
+        result["pending_slot"] = "extracted_lab_values"
+    return result
 
 
 def ask_fasting_node(state: AgentState) -> Dict[str, Any]:

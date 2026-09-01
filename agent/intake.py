@@ -399,6 +399,9 @@ def classify_interaction_intent(text: str, state: AgentState) -> str:
     if any(term in normalized for term in urgent_terms):
         return "urgent_red_flag"
 
+    if looks_like_greeting(normalized) or looks_like_scope_question(normalized):
+        return "general_info"
+
     if "Potassium" in lab_values:
         return "urgent_red_flag"
 
@@ -408,9 +411,6 @@ def classify_interaction_intent(text: str, state: AgentState) -> str:
 
     if lab_values or mentioned_lab_topics(normalized):
         return "lab_interpretation"
-
-    if looks_like_greeting(normalized) or looks_like_scope_question(normalized):
-        return "general_info"
 
     return state.get("intent") or "general_health"
 

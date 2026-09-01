@@ -27,6 +27,11 @@ def _looks_like_health_query(text: str, state: AgentState) -> bool:
     if not normalized:
         return False
 
+    has_non_health_term = any(term in normalized for term in INPUT_NON_HEALTH_TERMS)
+    has_health_term = any(term in normalized for term in INPUT_HEALTH_TERMS)
+    if has_non_health_term and not has_health_term:
+        return False
+
     if _looks_like_greeting(normalized) or _looks_like_scope_question(normalized):
         return True
 

@@ -3,6 +3,8 @@ import json
 import os
 import tempfile
 
+os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
+
 from langchain_google_vertexai import ChatVertexAI
 
 

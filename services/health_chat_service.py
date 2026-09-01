@@ -186,7 +186,15 @@ def _prepare_windowed_messages_and_summary(
         messages_to_summarize = older_messages
         summary_base = "" if saved_count > len(older_messages) else existing_summary
 
-    updated_summary = _summarize_messages(summary_base, messages_to_summarize)
+    try:
+        updated_summary = _summarize_messages(summary_base, messages_to_summarize)
+    except Exception as exc:
+        print(
+            "[History Window] Summary failed; continuing with cached summary. "
+            f"error={exc}"
+        )
+        return windowed_messages, existing_summary
+
     current_slots["summary"] = updated_summary
     current_slots[SUMMARY_MESSAGE_COUNT_FIELD] = len(older_messages)
     current_slots[SUMMARY_SOURCE_HASH_FIELD] = current_source_hash
