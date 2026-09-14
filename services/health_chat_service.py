@@ -7,7 +7,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from backend.dependencies import load_agent_resources
 from backend.openai_compat import empty_usage
 from backend.schemas import ChatRequest, Message
-from agent.llm_timing import timed_llm_invoke
+from agent.llm_timing import request_timing, timed_llm_invoke, timed_section
 
 
 SLOT_FIELD_NAMES = (
@@ -640,17 +640,45 @@ def run_chat_completion(
     *,
     is_webui_task: bool,
 ) -> tuple[str, dict[str, int], Optional[dict[str, Any]]]:
+    with request_timing(
+        route="chat_completion",
+        model=req.model,
+        stream_requested=bool(req.stream),
+        message_count=len(converted_messages),
+        latest_user_chars=len(latest_user_message),
+        openwebui_task=is_webui_task,
+    ) as timing:
+        return _run_chat_completion_with_timing(
+            req,
+            converted_messages,
+            latest_user_message,
+            is_webui_task=is_webui_task,
+            timing=timing,
+        )
+
+
+def _run_chat_completion_with_timing(
+    req: ChatRequest,
+    converted_messages: list[HumanMessage | AIMessage | SystemMessage],
+    latest_user_message: str,
+    *,
+    is_webui_task: bool,
+    timing: dict[str, Any],
+) -> tuple[str, dict[str, int], Optional[dict[str, Any]]]:
     usage_data = empty_usage()
 
     if is_webui_task:
         print("\n[Interceptor] Open WebUI automated task detected. Bypassing LangGraph.")
-        _, chat_model = load_agent_resources()
+        timing["path"] = "openwebui_automated_task"
+        with timed_section("agent_resource_load"):
+            _, chat_model = load_agent_resources()
         response = timed_llm_invoke(
             chat_model,
             converted_messages,
             "openwebui_automated_task",
         )
         assistant_content = response.content
+        timing["response_chars"] = len(str(assistant_content))
 
         meta = getattr(response, "usage_metadata", {}) or {}
         usage_data["prompt_tokens"] = meta.get("input_tokens", 0)
@@ -671,6 +699,7 @@ def run_chat_completion(
 
     fast_response = pending_slot_fast_response(conversation_key_value, latest_user_message)
     if fast_response:
+        timing["path"] = "slot_fast_path"
         assistant_content, response_metadata = fast_response
         metadata = response_metadata or {}
         health_state = health_state_snapshot(conversation_key_value)
@@ -685,19 +714,25 @@ def run_chat_completion(
     if _has_authoritative_profile_state(request_state):
         summary = f"{summary}{_authoritative_profile_instruction()}"
 
-    graph, _ = load_agent_resources()
-    result = graph.invoke({
-        "messages": windowed_messages,
-        "steps": [],
-        "current_node": "",
-        "intent": None,
-        **initial_slot_state(conversation_key_value, request_state),
-        "summary": summary,
-    })
+    with timed_section("agent_resource_load"):
+        graph, _ = load_agent_resources()
+    timing["path"] = "langgraph"
+    timing["history_window_messages"] = len(windowed_messages)
+    timing["summary_chars"] = len(summary)
+    with timed_section("graph_invoke"):
+        result = graph.invoke({
+            "messages": windowed_messages,
+            "steps": [],
+            "current_node": "",
+            "intent": None,
+            **initial_slot_state(conversation_key_value, request_state),
+            "summary": summary,
+        })
     save_slot_state(conversation_key_value, result)
 
     assistant_msg = result["messages"][-1]
     assistant_content = assistant_msg.content
+    timing["response_chars"] = len(str(assistant_content))
 
     meta = getattr(assistant_msg, "usage_metadata", {}) or {}
     usage_data["prompt_tokens"] = meta.get("input_tokens", 0)
@@ -705,6 +740,9 @@ def run_chat_completion(
     usage_data["total_tokens"] = meta.get("total_tokens", 0)
 
     metadata = slot_response_metadata(result) or {}
+    citations = result.get("citations") or []
+    if citations:
+        metadata["citations"] = citations
     health_state = health_state_snapshot(conversation_key_value)
     if health_state:
         metadata["health_state"] = health_state

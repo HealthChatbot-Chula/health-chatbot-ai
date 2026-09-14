@@ -7,8 +7,37 @@ from .followups import _append_structured_followup, _next_structured_followup
 from .llm_timing import timed_llm_invoke
 from .models import chat_model
 from .prompts import lab_prompt, no_context_prompt
-from .rag_utils import retrieve_context
+from .rag_utils import format_citations, retrieve_context
 from .state import AgentState
+
+
+# A lab value has a clear clinical home.  Constraining retrieval prevents a
+# plausible-but-wrong citation from another guideline (e.g. diabetes) being
+# attached to an LDL answer.
+LAB_SOURCE_IDS = {
+    "LDL": "dyslipidemia",
+    "HDL": "dyslipidemia",
+    "Triglycerides": "dyslipidemia",
+    "Total Cholesterol": "dyslipidemia",
+    "Cholesterol": "dyslipidemia",
+    "FBS": "diabetes",
+    "Glucose": "diabetes",
+    "HbA1c": "diabetes",
+    "Creatinine": "kidney",
+    "eGFR": "kidney",
+    "ACR": "kidney",
+    "Urine Albumin": "kidney",
+    "Systolic BP": "hypertension",
+    "Diastolic BP": "hypertension",
+    "Blood Pressure": "hypertension",
+}
+
+SOURCE_QUERY_TERMS = {
+    "dyslipidemia": "ไขมันในเลือด LDL HDL ไตรกลีเซอไรด์ การแปลผล",
+    "diabetes": "เบาหวาน น้ำตาลในเลือด HbA1c FBS การแปลผล",
+    "kidney": "โรคไต creatinine eGFR การแปลผล",
+    "hypertension": "ความดันโลหิต การแปลผล",
+}
 
 
 def _analysis_slot_context(state: AgentState) -> str:
@@ -46,19 +75,38 @@ def _has_structured_health_data(state: AgentState) -> bool:
     )
 
 
+def _source_ids_for_retrieval(state: AgentState, fallback_query: str) -> list[str]:
+    labs = state.get("extracted_lab_values") or {}
+    source_ids = {LAB_SOURCE_IDS[name] for name in labs if name in LAB_SOURCE_IDS}
+    if source_ids:
+        return sorted(source_ids)
+
+    # This covers text-only questions before slot extraction finds a numeric
+    # lab value.  Do not filter ambiguous general-health questions.
+    text = fallback_query.lower()
+    keyword_sources = {
+        "dyslipidemia": ("ldl", "hdl", "cholesterol", "ไขมัน", "ไตรกลีเซอไรด์"),
+        "diabetes": ("hba1c", "fbs", "glucose", "เบาหวาน", "น้ำตาล"),
+        "kidney": ("egfr", "creatinine", "ไต", "ครีอะตินิน"),
+        "hypertension": ("ความดัน", "blood pressure", "bp"),
+    }
+    return sorted(
+        source_id
+        for source_id, keywords in keyword_sources.items()
+        if any(keyword in text for keyword in keywords)
+    )
+
+
 def _analysis_retrieval_query(state: AgentState, fallback_query: str) -> str:
     labs = state.get("extracted_lab_values") or {}
+    source_ids = _source_ids_for_retrieval(state, fallback_query)
     if not labs:
         return fallback_query
 
-    query_parts = [
-        "health checkup lab interpretation",
-        "diabetes dyslipidemia kidney liver blood pressure",
-        f"age {state.get('age')}",
-        f"gender {state.get('gender')}",
-        f"fasting {state.get('fasting_status')}",
-        f"intent {state.get('intent')}",
-    ]
+    # Keep the embedding query clinical and specific.  Previously, including
+    # every disease in one query caused cross-guideline matches for LDL.
+    query_parts = [SOURCE_QUERY_TERMS[source_id] for source_id in source_ids]
+    query_parts.append("การแปลผลตรวจสุขภาพ")
     query_parts.extend(f"{name} {value}" for name, value in labs.items())
     return " ".join(str(part) for part in query_parts if part)
 
@@ -72,12 +120,15 @@ def call_model(state: AgentState):
     last_user_message = messages[-1].content
 
     retrieval_query = _analysis_retrieval_query(state, last_user_message)
-    context = retrieve_context(retrieval_query)
+    source_ids = _source_ids_for_retrieval(state, last_user_message)
+    retrieved = retrieve_context(retrieval_query, source_ids=source_ids)
+    context = retrieved.context
 
     summary_context = f"\n\nสรุปบริบทการสนทนาก่อนหน้านี้: {summary}" if summary else ""
     summary_context += _analysis_slot_context(state)
 
     print("=== RETRIEVAL QUERY ===", retrieval_query)
+    print("=== RETRIEVAL SOURCE FILTER ===", source_ids or "all")
     print("=== CONTEXT ===", context)
 
     if context or _has_structured_health_data(state):
@@ -107,8 +158,24 @@ def call_model(state: AgentState):
     result = {
         "messages": [response],
         "steps": state.get("steps", []) + ["retrieval", "generate"],
+        "citations": retrieved.citations,
     }
     if pending_slot:
         result["pending_slot"] = pending_slot
 
     return result
+
+
+def append_citations_node(state: AgentState):
+    """Append only retrieval-backed textbook citations after safety review."""
+    citation_text = format_citations(state.get("citations") or [])
+    if not citation_text:
+        return {}
+
+    last_message = state["messages"][-1]
+    content = f"{last_message.content}\n\n{citation_text}"
+    if hasattr(last_message, "model_copy"):
+        message = last_message.model_copy(update={"content": content})
+    else:
+        message = last_message.copy(update={"content": content})
+    return {"messages": [message]}

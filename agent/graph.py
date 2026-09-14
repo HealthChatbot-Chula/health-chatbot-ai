@@ -1,7 +1,7 @@
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from .analyst import call_model
+from .analyst import append_citations_node, call_model
 from .guardrails import (
     guardrail_input_node,
     guardrail_output_node,
@@ -44,6 +44,7 @@ def build_graph():
     graph.add_node("ask_gender_node", ask_gender_node)
     graph.add_node("our_agent", call_model)
     graph.add_node("guardrail_output", guardrail_output_node)
+    graph.add_node("append_citations", append_citations_node)
     graph.add_node("summarize", summarize_conversation)
 
     tool_node = ToolNode(tools=tools)
@@ -89,7 +90,8 @@ def build_graph():
         },
     )
 
-    graph.add_edge("guardrail_output", "summarize")
+    graph.add_edge("guardrail_output", "append_citations")
+    graph.add_edge("append_citations", "summarize")
     graph.add_edge("summarize", END)
     graph.add_edge("tools", "our_agent")
 

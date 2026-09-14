@@ -9,3 +9,5 @@ __pycache__/
 /chroma_db_health/
 
 key.json
+
+raw_data/**

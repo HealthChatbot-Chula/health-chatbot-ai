@@ -27,3 +27,6 @@ class AgentState(TypedDict, total=False):
     fasting_status: Optional[str]  # "yes" or "no"
     extracted_lab_values: Optional[Dict[str, float]]
     pending_slot: Optional[str]
+
+    # Source records for citations appended after the safety review.
+    citations: Optional[List[Dict[str, object]]]
