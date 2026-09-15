@@ -39,6 +39,37 @@ SOURCE_QUERY_TERMS = {
     "hypertension": "ความดันโลหิต การแปลผล",
 }
 
+SOURCE_KEYWORDS = {
+    "dyslipidemia": (
+        "ldl", "hdl", "cholesterol", "ไขมัน", "ไตรกลีเซอไรด์", "tg",
+        "triglyceride", "statin", "lipid profile", "non-hdl",
+    ),
+    "diabetes": (
+        "hba1c", "fbs", "glucose", "เบาหวาน", "น้ำตาล", "metformin",
+        "ogtt", "น้ำตาลต่ำ", "น้ำตาลสูง",
+    ),
+    "kidney": (
+        "egfr", "creatinine", "ไต", "ครีอะตินิน", "ckd", "acr",
+        "โปรตีนรั่ว", "อัลบูมิน", "ฟอกไต", "dialysis", "โพแทสเซียม",
+        "nsaid",
+    ),
+    "hypertension": (
+        "ความดัน", "blood pressure", "bp", "amlodipine", "ace inhibitor",
+        "arb", "ความดันตัวบน", "ความดันตัวล่าง", "โซเดียม",
+    ),
+}
+
+# These terms identify the clinical question's primary guideline.  They take
+# precedence over a related disease named in the same question, e.g. CKD + LDL
+# should cite the CKD guideline's lipid recommendation rather than a generic
+# dyslipidemia page.
+PRIMARY_SOURCE_KEYWORDS = {
+    "kidney": (
+        "egfr", "creatinine", "ครีอะตินิน", "ckd", "acr", "โปรตีนรั่ว",
+        "ฟอกไต", "dialysis", "โพแทสเซียม", "โรคไต", "ไตเรื้อรัง",
+    ),
+}
+
 
 def _analysis_slot_context(state: AgentState) -> str:
     labs = state.get("extracted_lab_values") or {}
@@ -46,7 +77,7 @@ def _analysis_slot_context(state: AgentState) -> str:
     profile_metrics = state.get("profile_metrics")
     health_state = state.get("health_state")
     return (
-        "\n\nข้อมูล structured ที่สกัดได้ก่อนวิเคราะห์:"
+        "\n\nStructured data extracted before analysis:"
         f"\n- intent: {state.get('intent')}"
         f"\n- age: {state.get('age')}"
         f"\n- gender: {state.get('gender')}"
@@ -77,24 +108,20 @@ def _has_structured_health_data(state: AgentState) -> bool:
 
 def _source_ids_for_retrieval(state: AgentState, fallback_query: str) -> list[str]:
     labs = state.get("extracted_lab_values") or {}
-    source_ids = {LAB_SOURCE_IDS[name] for name in labs if name in LAB_SOURCE_IDS}
-    if source_ids:
-        return sorted(source_ids)
-
-    # This covers text-only questions before slot extraction finds a numeric
-    # lab value.  Do not filter ambiguous general-health questions.
     text = fallback_query.lower()
-    keyword_sources = {
-        "dyslipidemia": ("ldl", "hdl", "cholesterol", "ไขมัน", "ไตรกลีเซอไรด์"),
-        "diabetes": ("hba1c", "fbs", "glucose", "เบาหวาน", "น้ำตาล"),
-        "kidney": ("egfr", "creatinine", "ไต", "ครีอะตินิน"),
-        "hypertension": ("ความดัน", "blood pressure", "bp"),
-    }
-    return sorted(
+    for source_id, keywords in PRIMARY_SOURCE_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return [source_id]
+
+    # Combine lab extraction and text rules.  This supports multi-condition
+    # questions while still routing short medical terms such as "statin".
+    source_ids = {LAB_SOURCE_IDS[name] for name in labs if name in LAB_SOURCE_IDS}
+    source_ids.update(
         source_id
-        for source_id, keywords in keyword_sources.items()
+        for source_id, keywords in SOURCE_KEYWORDS.items()
         if any(keyword in text for keyword in keywords)
     )
+    return sorted(source_ids)
 
 
 def _analysis_retrieval_query(state: AgentState, fallback_query: str) -> str:
@@ -124,7 +151,7 @@ def call_model(state: AgentState):
     retrieved = retrieve_context(retrieval_query, source_ids=source_ids)
     context = retrieved.context
 
-    summary_context = f"\n\nสรุปบริบทการสนทนาก่อนหน้านี้: {summary}" if summary else ""
+    summary_context = f"\n\nPrevious conversation summary: {summary}" if summary else ""
     summary_context += _analysis_slot_context(state)
 
     print("=== RETRIEVAL QUERY ===", retrieval_query)
@@ -134,8 +161,8 @@ def call_model(state: AgentState):
     if context or _has_structured_health_data(state):
         if not context:
             context = (
-                "ไม่มีข้อมูลจาก RAG ที่ตรงพอในรอบนี้ ให้ใช้ข้อมูล structured "
-                "จากผู้ใช้ด้านบนเป็นหลัก และห้ามตอบว่าผู้ใช้ยังไม่ได้ให้ค่าผลตรวจ"
+                "No sufficiently relevant RAG material was found. Use the structured user data above "
+                "as the primary source, and do not state that the user has not provided laboratory values."
             )
         system_prompt = lab_prompt(context, summary_context)
     else:
@@ -168,6 +195,9 @@ def call_model(state: AgentState):
 
 def append_citations_node(state: AgentState):
     """Append only retrieval-backed textbook citations after safety review."""
+    if "retrieval" not in state.get("steps", []):
+        return {}
+
     citation_text = format_citations(state.get("citations") or [])
     if not citation_text:
         return {}

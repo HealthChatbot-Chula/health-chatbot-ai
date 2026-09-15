@@ -36,5 +36,10 @@ intent_model = ChatVertexAI(
 )
 
 chat_model = ChatVertexAI(
-    model="gemini-2.5-flash",
+    # Flash-Lite is sufficient for this constrained, retrieval-grounded health
+    # response.  The deterministic guardrails and citation pipeline still run
+    # unchanged, while this materially lowers generation latency.
+    model=os.getenv("HEALTH_CHAT_MODEL", "gemini-2.5-flash-lite"),
+    temperature=0,
+    max_output_tokens=300,
 )

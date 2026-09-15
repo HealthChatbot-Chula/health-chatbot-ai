@@ -164,18 +164,17 @@ def guardrail_output_node(state: AgentState):
     print(f"    🔎 REVIEW REQUIRED: {review_reason}")
 
     guard_prompt = (
-        "คุณคือหัวหน้าพยาบาลผู้ตรวจทานข้อความ (Safety Editor)\n"
-        "ตรวจสอบคำตอบของ AI ตามกฎด้านล่าง แล้วตอบเป็น JSON เท่านั้น\n\n"
-        "--- กฎการตรวจสอบ ---\n"
-        "1. ห้ามยืนยันว่าเป็นโรคเด็ดขาด ให้ใช้คำว่า 'มีความเสี่ยง' หรือ 'แนวโน้ม'\n"
-        "2. ห้ามระบุชื่อยาหรือวิธีใช้ยา\n"
-        "3. ห้ามใช้คำที่ทำให้ตกใจ: อันตราย, วิกฤต, ร้ายแรง\n\n"
-        "รูปแบบคำตอบ JSON (ห้ามมีข้อความอื่น):\n"
-        "ถ้าผ่านทุกกฎ: "
+        "You are a senior-nurse safety editor. Review the AI answer against the rules below and return JSON only.\n\n"
+        "--- Review rules ---\n"
+        "1. Do not state a disease as certain; use Thai wording equivalent to preliminary risk or trend.\n"
+        "2. Do not give medication names, doses, or instructions.\n"
+        "3. Avoid alarming Thai wording equivalent to dangerous, critical, or severe.\n\n"
+        "JSON format (no additional text):\n"
+        "If all rules pass: "
         '{"action": "PASSED", "revised_content": null}\n'
-        "ถ้าไม่ผ่าน: "
-        '{"action": "MODIFIED", "revised_content": "ข้อความที่แก้ไขแล้วทั้งหมด"}\n\n'
-        f"ข้อความที่ต้องตรวจ:\n{last_ai_message}"
+        "If a revision is needed: "
+        '{"action": "MODIFIED", "revised_content": "complete revised Thai response"}\n\n'
+        f"Answer to review:\n{last_ai_message}"
     )
 
     result = timed_llm_invoke(

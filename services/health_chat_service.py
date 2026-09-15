@@ -127,15 +127,15 @@ def _summarize_messages(
 
     transcript = _format_messages_for_summary(messages_to_summarize)
     prompt = (
-        "สรุปบทสนทนาก่อนหน้าเพื่อส่งต่อให้ health chatbot ใช้เป็นบริบทแบบสั้นมาก\n"
-        "ให้เก็บเฉพาะข้อเท็จจริงที่สำคัญ เช่น อายุ เพศ ผลตรวจ โรคประจำตัว ยาที่ใช้ อาการ "
-        "คำถาม/ความกังวลของผู้ใช้ และคำตอบสำคัญที่เคยให้ไป\n"
-        "ห้ามให้คำแนะนำใหม่ ห้ามวินิจฉัย และห้ามแต่งข้อมูลที่ไม่มีใน transcript\n"
-        "ตอบเป็นภาษาไทย ไม่เกิน 8 bullet สั้น ๆ\n\n"
+        "Summarize the preceding conversation into compact context for a health chatbot.\n"
+        "Keep only important facts: age, sex, laboratory results, conditions, medications, symptoms, "
+        "the user's questions or concerns, and important prior answers.\n"
+        "Do not give new advice, diagnose, or invent facts absent from the transcript.\n"
+        "Write the summary in Thai in no more than eight short bullet points.\n\n"
     )
     if existing_summary:
-        prompt += f"สรุปเดิม:\n{existing_summary}\n\n"
-    prompt += f"ข้อความใหม่ที่ต้องรวมเข้า summary:\n{transcript}"
+        prompt += f"Existing summary:\n{existing_summary}\n\n"
+    prompt += f"New transcript to incorporate:\n{transcript}"
 
     response = timed_llm_invoke(
         intent_model,
@@ -422,12 +422,10 @@ def _has_authoritative_profile_state(request_state: dict[str, Any]) -> bool:
 
 def _authoritative_profile_instruction() -> str:
     return (
-        "\n\nข้อกำหนดสำคัญเกี่ยวกับข้อมูลสุขภาพปัจจุบัน:"
-        "\n- ค่าใน structured data ด้านล่างคือข้อมูลล่าสุดที่ผู้ใช้ยืนยัน/บันทึกใน profile หรือ form"
-        "\n- ถ้า summary หรือประวัติแชทมีค่าผลตรวจ/ความดันที่ขัดกับ structured data "
-        "ให้ถือว่า summary/ประวัติเป็นข้อมูลเก่า"
-        "\n- ใช้ summary และประวัติแชทเพื่อเข้าใจเจตนา/บริบทการถามเท่านั้น "
-        "ห้ามใช้ค่าตัวเลขเก่าแทนค่าจาก structured data ล่าสุด"
+        "\n\nImportant current-health-data instructions:"
+        "\n- The structured data below is the latest information confirmed by the user or saved in a profile/form."
+        "\n- If the summary or chat history conflicts with structured laboratory or blood-pressure values, treat it as outdated."
+        "\n- Use the summary and chat history only to understand intent and context; never replace current structured values with older numbers."
     )
 
 

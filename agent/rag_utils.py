@@ -13,8 +13,11 @@ PERSIST_DIRECTORY = os.path.join(BASE_DIR, "data", "chroma_db_health")
 EMBEDDING_MODEL = "BAAI/bge-m3"
 
 _vector_db: Optional[Chroma] = None
-MAX_CONTEXT_CHARS_PER_DOC = 900
-MAX_TOTAL_CONTEXT_CHARS = 3200
+# Three page-local chunks still give the answer model enough evidence while
+# avoiding a large prompt that slows down every normal chat response.
+MAX_CONTEXT_CHARS_PER_DOC = 650
+MAX_TOTAL_CONTEXT_CHARS = 2200
+MULTI_DISEASE_K_PER_SOURCE = 2
 
 
 @dataclass
@@ -48,6 +51,12 @@ def _get_vector_db() -> Chroma:
     return _vector_db
 
 
+def warm_retrieval_resources() -> None:
+    """Load BGE-M3 and Chroma before the first user request reaches RAG."""
+
+    _get_vector_db()
+
+
 def retrieve_context(
     query: str,
     k: int = 3,
@@ -59,27 +68,43 @@ def retrieve_context(
 
     try:
         cache_state = "warm" if _vector_db is not None else "cold"
-        source_filter = None
-        if source_ids:
-            # Chroma accepts a direct equality filter for one source and $in for
-            # combined lab panels (for example FBS + LDL).
-            source_filter = (
-                {"source_id": source_ids[0]}
-                if len(source_ids) == 1
-                else {"source_id": {"$in": list(source_ids)}}
-            )
         with timed_section(
             "rag_retrieval",
             cache_state=cache_state,
             query_chars=len(query),
             k=k,
             source_ids=list(source_ids or []),
+            per_source_k=MULTI_DISEASE_K_PER_SOURCE if source_ids and len(source_ids) > 1 else None,
         ):
-            results = _get_vector_db().similarity_search(
-                query,
-                k=k,
-                filter=source_filter,
-            )
+            vector_db = _get_vector_db()
+            if source_ids and len(source_ids) > 1:
+                # Embed the question once, then retrieve from each routed book.
+                # Round-robin ordering guarantees that a shared context budget
+                # retains evidence for every disease rather than letting one
+                # source consume all top-k positions.
+                embedding_function = vector_db._embedding_function
+                query_embedding = embedding_function.embed_query(query)
+                per_source_results = {
+                    source_id: vector_db.similarity_search_by_vector(
+                        query_embedding,
+                        k=MULTI_DISEASE_K_PER_SOURCE,
+                        filter={"source_id": source_id},
+                    )
+                    for source_id in source_ids
+                }
+                results = []
+                for rank in range(MULTI_DISEASE_K_PER_SOURCE):
+                    for source_id in source_ids:
+                        matches = per_source_results[source_id]
+                        if rank < len(matches):
+                            results.append(matches[rank])
+            else:
+                source_filter = {"source_id": source_ids[0]} if source_ids else None
+                results = vector_db.similarity_search(
+                    query,
+                    k=k,
+                    filter=source_filter,
+                )
 
         if not results:
             return RetrievedContext(context="", citations=[])
@@ -91,17 +116,6 @@ def retrieve_context(
         for index, doc in enumerate(results, start=1):
             source = str(doc.metadata.get("source_title", "Unknown Source"))
             book_page = doc.metadata.get("book_page")
-            citation_key = (source, book_page)
-            if book_page is not None and citation_key not in seen_citations:
-                citations.append(
-                    {
-                        "source_id": doc.metadata.get("source_id"),
-                        "source_title": source,
-                        "book_page": book_page,
-                        "source_file": doc.metadata.get("source_file"),
-                    }
-                )
-                seen_citations.add(citation_key)
             content = doc.page_content.replace("\n", " ")
             if len(content) > MAX_CONTEXT_CHARS_PER_DOC:
                 content = f"{content[:MAX_CONTEXT_CHARS_PER_DOC]}..."
@@ -113,6 +127,17 @@ def retrieve_context(
                 part
             )
             total_chars += len(part)
+            citation_key = (source, book_page)
+            if book_page is not None and citation_key not in seen_citations:
+                citations.append(
+                    {
+                        "source_id": doc.metadata.get("source_id"),
+                        "source_title": source,
+                        "book_page": book_page,
+                        "source_file": doc.metadata.get("source_file"),
+                    }
+                )
+                seen_citations.add(citation_key)
 
         return RetrievedContext(context="\n\n".join(context_parts), citations=citations)
 
@@ -124,9 +149,28 @@ def retrieve_context(
 def format_citations(citations: list[dict[str, object]]) -> str:
     if not citations:
         return ""
-    lines = ["อ้างอิงจากตำรา:"]
+
+    # A retrieval can yield several useful pages from one textbook.  Grouping
+    # them keeps the user-facing answer compact without losing page-level refs.
+    grouped: dict[tuple[object, object], dict[str, object]] = {}
     for citation in citations:
-        source = citation.get("source_title", "ไม่ทราบแหล่งข้อมูล")
+        source_id = citation.get("source_id")
+        source_title = citation.get("source_title", "ไม่ทราบแหล่งข้อมูล")
+        key = (source_id, source_title)
+        entry = grouped.setdefault(
+            key,
+            {"source_title": source_title, "pages": []},
+        )
         page = citation.get("book_page")
-        lines.append(f"- {source}, หน้า {page}")
+        if page is not None and page not in entry["pages"]:
+            entry["pages"].append(page)
+
+    lines = ["อ้างอิงจากตำรา:"]
+    for entry in grouped.values():
+        source = entry["source_title"]
+        pages = entry["pages"]
+        if pages:
+            lines.append(f"- {source}, หน้า {', '.join(str(page) for page in pages)}")
+        else:
+            lines.append(f"- {source}")
     return "\n".join(lines)

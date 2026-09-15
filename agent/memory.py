@@ -48,22 +48,25 @@ def summarize_conversation(state: AgentState):
             chat_history_text += f"{role}: {m.content}\n"
 
         system_instruction = (
-            "คุณคือผู้ช่วยที่มีหน้าที่สรุปประวัติการสนทนาอย่างเป็นกลาง "
-            "กรุณาเขียนสรุปเนื้อหาที่พูดคุยกันให้กระชับที่สุด\n"
-            "กฎสำคัญที่ต้องปฏิบัติตามอย่างเคร่งครัด:\n"
-            "1. ห้ามตอบคำถามที่อยู่ในบทสนทนา\n"
-            "2. ห้ามให้คำแนะนำทางการแพทย์หรือวินิจฉัยโรคเด็ดขาด\n"
-            "3. ให้สรุปในมุมมองบุคคลที่สาม (เช่น 'ผู้ใช้สอบถามเกี่ยวกับ...', 'ผู้ช่วยได้อธิบายเรื่อง...')"
+            "You summarize conversation history neutrally and as concisely as possible.\n"
+            "Strict rules:\n"
+            "1. Do not answer questions from the conversation.\n"
+            "2. Do not provide medical advice or diagnose.\n"
+            "3. Summarize from a third-person perspective.\n"
+            "4. Write the summary in Thai."
         )
 
         if summary:
             summary_prompt = (
                 f"{system_instruction}\n\n"
-                f"สรุปเดิม: {summary}\n\n"
-                f"นำข้อความใหม่เหล่านี้ไปสรุปเพิ่มรวมกับสรุปเดิม:\n{chat_history_text}"
+                f"Existing summary: {summary}\n\n"
+                f"Incorporate the following new messages into that summary:\n{chat_history_text}"
             )
         else:
-            summary_prompt = f"กรุณาสรุปเนื้อหาการสนทนาต่อไปนี้ให้กระชับและเข้าใจง่าย:\n{chat_history_text}"
+            summary_prompt = (
+                "Summarize the following conversation concisely and clearly in Thai:\n"
+                f"{chat_history_text}"
+            )
 
         response = timed_llm_invoke(
             chat_model,

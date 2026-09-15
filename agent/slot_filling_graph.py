@@ -205,6 +205,15 @@ def route_after_extraction(state: AgentState) -> str:
     """Route after extraction without blocking answers on optional profile slots."""
 
     latest_user_message = _latest_user_text(state.get("messages", []))
+    labs = state.get("extracted_lab_values") or {}
+
+    # When the preceding turn asked for a laboratory value, a reply containing
+    # only profile information (for example, "I am 26") must stay on the
+    # deterministic intake path.  Previously it could fall through to the
+    # analyst, trigger RAG, and append irrelevant textbook citations.
+    if state.get("pending_slot") == "extracted_lab_values" and not labs:
+        return "ask_lab_node"
+
     if state.get("intent") == "general_info" and (
         _looks_like_greeting(latest_user_message)
         or _looks_like_scope_question(latest_user_message)
@@ -257,7 +266,9 @@ def ask_lab_node(state: AgentState) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "messages": [
             AIMessage(content=content)
-        ]
+        ],
+        # Explicitly clear any transient retrieval data on an intake-only turn.
+        "citations": [],
     }
     if not labs:
         result["pending_slot"] = "extracted_lab_values"
@@ -267,6 +278,7 @@ def ask_lab_node(state: AgentState) -> Dict[str, Any]:
 def ask_fasting_node(state: AgentState) -> Dict[str, Any]:
     return {
         "pending_slot": "fasting_status",
+        "citations": [],
         "messages": [
             AIMessage(
                 content=(
@@ -285,6 +297,7 @@ def ask_age_node(state: AgentState) -> Dict[str, Any]:
 
     return {
         "pending_slot": "age",
+        "citations": [],
         "messages": [
             AIMessage(content=question)
         ]
@@ -294,6 +307,7 @@ def ask_age_node(state: AgentState) -> Dict[str, Any]:
 def ask_gender_node(state: AgentState) -> Dict[str, Any]:
     return {
         "pending_slot": "gender",
+        "citations": [],
         "messages": [
             AIMessage(
                 content=(
