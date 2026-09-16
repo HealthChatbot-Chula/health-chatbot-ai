@@ -26,6 +26,7 @@ from .intake import (
     next_required_slot,
     parse_intake_updates,
 )
+from .metric_extraction import extract_metrics_with_llm
 from .state import AgentState
 
 
@@ -172,9 +173,11 @@ def _updates_from_pending_slot(state: AgentState, latest_user_message: str) -> D
 
 def extract_info_node(state: AgentState) -> Dict[str, Any]:
     """
-    Extract patient slots from the latest user message and merge them into state
-    using deterministic rules. This node must stay LLM-free so incomplete intake
-    turns can return fixed questions quickly.
+    Extract patient slots from the latest user message and merge them into state.
+
+    Deterministic rules run first and always win. The model pass only fills
+    catalog fields the patterns cannot reach, and is skipped entirely when the
+    message has no digits, so digit-free intake turns stay LLM-free and fast.
     """
 
     messages = state.get("messages", [])
@@ -182,17 +185,39 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
     if not latest_user_message:
         return {}
 
+    conversation_context = _conversation_user_text(messages)
     extracted_updates = parse_intake_updates(
         state,
         latest_user_message,
-        _conversation_user_text(messages),
+        conversation_context,
     )
+
+    model_values = extract_metrics_with_llm(latest_user_message, conversation_context)
+    if model_values is not None:
+        # The model read the whole sentence, so it decides for this turn. Patterns
+        # cannot tell "LDL 154" from "LDL ควรต่ำกว่า 100 ไหม" and would save the
+        # threshold out of a question. An empty result means "nothing to save here",
+        # which is why it still overrides the patterns.
+        known_values = state.get("extracted_lab_values") or {}
+        merged_values = {**known_values, **model_values}
+        if merged_values != known_values:
+            extracted_updates["extracted_lab_values"] = merged_values
+            extracted_updates["pending_slot"] = None
+        else:
+            extracted_updates.pop("extracted_lab_values", None)
+            if not merged_values:
+                # Nothing was captured, so the turn must not look like the lab
+                # slot got answered; leave the pending question standing.
+                extracted_updates.pop("pending_slot", None)
+
     merged_state: AgentState = {**state, **extracted_updates}
     intent = _classify_interaction_intent(latest_user_message, merged_state)
 
     print(
-        "[slot_filling] deterministic intake: "
-        f"updates={{{', '.join(sorted(extracted_updates.keys()))}}}, intent={intent}"
+        "[slot_filling] intake: "
+        f"updates={{{', '.join(sorted(extracted_updates.keys()))}}}, "
+        f"model_fields={sorted(model_values) if model_values is not None else 'skipped'}, "
+        f"intent={intent}"
     )
 
     return {
