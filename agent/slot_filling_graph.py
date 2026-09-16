@@ -20,6 +20,7 @@ from .intake import (
     extract_lab_values,
     latest_user_text,
     looks_like_greeting,
+    is_health_overview_request,
     looks_like_scope_question,
     mentioned_lab_topics,
     needs_fasting_status,
@@ -28,6 +29,15 @@ from .intake import (
 )
 from .metric_extraction import extract_metrics_with_llm
 from .state import AgentState
+
+
+_PROFILE_ONLY_METRICS = {
+    "Height", "Weight", "BMI", "WaistCircumference", "HeartRate",
+}
+_PROFILE_METRIC_LABELS = {
+    "Height": "ส่วนสูง", "Weight": "น้ำหนัก", "BMI": "BMI",
+    "WaistCircumference": "รอบเอว", "HeartRate": "ชีพจร",
+}
 
 
 def _latest_user_text(messages: List[BaseMessage]) -> str:
@@ -220,9 +230,22 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
         f"intent={intent}"
     )
 
+    profile_update_only = bool(
+        model_values
+        and set(model_values).issubset(_PROFILE_ONLY_METRICS)
+        and "?" not in latest_user_message
+        and "ไหม" not in latest_user_message
+        and "เท่าไร" not in latest_user_message
+    )
     return {
         **extracted_updates,
         "intent": intent,
+        # A plain profile update (e.g. "เราพึ่งไปวัดส่วนสูงมาใหม่ ได้ 170")
+        # should acknowledge the saved value, not re-interpret every older lab
+        # result in the conversation and attach their citations.
+        "profile_update_only": profile_update_only,
+        "profile_update_fields": sorted(model_values) if profile_update_only else [],
+        "health_overview_request": is_health_overview_request(latest_user_message),
     }
 
 
@@ -231,6 +254,9 @@ def route_after_extraction(state: AgentState) -> str:
 
     latest_user_message = _latest_user_text(state.get("messages", []))
     labs = state.get("extracted_lab_values") or {}
+
+    if state.get("profile_update_only"):
+        return "acknowledge_profile_update"
 
     # When the preceding turn asked for a laboratory value, a reply containing
     # only profile information (for example, "I am 26") must stay on the
@@ -254,6 +280,22 @@ def route_after_extraction(state: AgentState) -> str:
     # Once lab/profile data is available, answer the primary question first.
     # Age, gender, and fasting status are collected by the analyst follow-up.
     return "our_agent"
+
+
+def acknowledge_profile_update_node(state: AgentState) -> Dict[str, Any]:
+    """Confirm a profile-only change without invoking retrieval or the LLM."""
+    labels = [
+        _PROFILE_METRIC_LABELS[key]
+        for key in state.get("profile_update_fields") or []
+        if key in _PROFILE_METRIC_LABELS
+    ]
+    detail = " และ ".join(labels) if labels else "ข้อมูลสุขภาพ"
+    return {
+        "messages": [AIMessage(content=f"รับทราบครับ อัปเดต{detail}ให้แล้วครับ")],
+        "citations": [],
+        "profile_update_only": False,
+        "profile_update_fields": [],
+    }
 
 
 def ask_lab_node(state: AgentState) -> Dict[str, Any]:

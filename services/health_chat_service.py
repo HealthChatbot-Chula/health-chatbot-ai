@@ -489,8 +489,33 @@ def initial_slot_state(
 ) -> dict[str, Any]:
     saved_slots = slot_memory_store.get(conversation_key_value, {})
     if request_state:
-        saved_slots = {**saved_slots, **request_state}
+        saved_slots = _merge_slot_state(saved_slots, request_state)
     return {field_name: saved_slots.get(field_name) for field_name in SLOT_FIELD_NAMES}
+
+
+def _merge_slot_state(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge partial profile updates without losing prior conversation labs."""
+
+    merged = {**existing, **incoming}
+    if "extracted_lab_values" in incoming:
+        from agent.intake import merge_lab_values
+
+        merged["extracted_lab_values"] = merge_lab_values(
+            existing.get("extracted_lab_values"),
+            incoming.get("extracted_lab_values"),
+        ) or {}
+
+    # Profile forms commonly submit only fields changed in this turn. Preserve
+    # the rest of a dictionary-shaped profile for answer context as well.
+    old_metrics = existing.get("profile_metrics")
+    new_metrics = incoming.get("profile_metrics")
+    if isinstance(old_metrics, dict) and isinstance(new_metrics, dict):
+        merged["profile_metrics"] = {**old_metrics, **new_metrics}
+
+    return merged
 
 
 def save_slot_state(conversation_key_value: str, graph_result: dict[str, Any]) -> None:
@@ -688,10 +713,10 @@ def _run_chat_completion_with_timing(
     conversation_key_value = conversation_key(req)
     request_state = _request_health_state(req)
     if request_state:
-        slot_memory_store[conversation_key_value] = {
-            **slot_memory_store.get(conversation_key_value, {}),
-            **request_state,
-        }
+        slot_memory_store[conversation_key_value] = _merge_slot_state(
+            slot_memory_store.get(conversation_key_value, {}),
+            request_state,
+        )
         if _has_authoritative_profile_state(request_state):
             slot_memory_store[conversation_key_value]["pending_slot"] = None
 

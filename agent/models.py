@@ -41,5 +41,8 @@ chat_model = ChatVertexAI(
     # unchanged, while this materially lowers generation latency.
     model=os.getenv("HEALTH_CHAT_MODEL", "gemini-2.5-flash-lite"),
     temperature=0,
-    max_output_tokens=300,
+    # 300 can truncate a Thai multi-result health summary mid-sentence. The
+    # prompt still requests concise answers; this is only a safe completion
+    # ceiling for cases containing several lab domains.
+    max_output_tokens=512,
 )

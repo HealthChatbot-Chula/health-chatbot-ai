@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any
 
 from langchain_core.messages import SystemMessage
@@ -6,8 +7,8 @@ from langchain_core.messages import SystemMessage
 from .followups import _append_structured_followup, _next_structured_followup
 from .llm_timing import timed_llm_invoke
 from .models import chat_model
-from .prompts import lab_prompt, no_context_prompt
-from .rag_utils import format_citations, retrieve_context
+from .prompts import health_overview_prompt, lab_prompt, no_context_prompt
+from .rag_utils import RetrievedContext, format_citations, retrieve_context
 from .state import AgentState
 
 
@@ -23,6 +24,9 @@ LAB_SOURCE_IDS = {
     "FBS": "diabetes",
     "Glucose": "diabetes",
     "HbA1c": "diabetes",
+    "2-hr PG": "diabetes",
+    "SBP": "hypertension",
+    "DBP": "hypertension",
     "Creatinine": "kidney",
     "eGFR": "kidney",
     "ACR": "kidney",
@@ -146,19 +150,28 @@ def call_model(state: AgentState):
     summary = state.get("summary", "")
     last_user_message = messages[-1].content
 
+    is_overview = bool(state.get("health_overview_request"))
     retrieval_query = _analysis_retrieval_query(state, last_user_message)
     source_ids = _source_ids_for_retrieval(state, last_user_message)
-    retrieved = retrieve_context(retrieval_query, source_ids=source_ids)
+    # A dashboard-style overview is based on the user's saved measurements.
+    # Do not retrieve textbook excerpts or expose citations on this route.
+    retrieved = (
+        RetrievedContext(context="", citations=[])
+        if is_overview
+        else retrieve_context(retrieval_query, source_ids=source_ids)
+    )
     context = retrieved.context
 
     summary_context = f"\n\nPrevious conversation summary: {summary}" if summary else ""
     summary_context += _analysis_slot_context(state)
 
-    print("=== RETRIEVAL QUERY ===", retrieval_query)
-    print("=== RETRIEVAL SOURCE FILTER ===", source_ids or "all")
+    print("=== RETRIEVAL QUERY ===", "skipped for health overview" if is_overview else retrieval_query)
+    print("=== RETRIEVAL SOURCE FILTER ===", "none" if is_overview else source_ids or "all")
     print("=== CONTEXT ===", context)
 
-    if context or _has_structured_health_data(state):
+    if is_overview:
+        system_prompt = health_overview_prompt(summary_context)
+    elif context or _has_structured_health_data(state):
         if not context:
             context = (
                 "No sufficiently relevant RAG material was found. Use the structured user data above "
@@ -193,17 +206,53 @@ def call_model(state: AgentState):
     return result
 
 
+def _drop_incomplete_trailing_markdown(content: str) -> str:
+    """Remove an unfinished Markdown fragment if generation stopped mid-line.
+
+    This is a presentation safeguard only.  The prompt keeps the substantive
+    safety action first; this prevents a dangling token such as ``**การ`` from
+    being shown immediately before the application-owned citations.
+    """
+    lines = content.rstrip().splitlines()
+    while lines:
+        last = lines[-1].strip()
+        if not last:
+            lines.pop()
+            continue
+        if last.startswith("**") and last.count("**") % 2:
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines).rstrip()
+
+
 def append_citations_node(state: AgentState):
     """Append only retrieval-backed textbook citations after safety review."""
     if "retrieval" not in state.get("steps", []):
         return {}
+    if state.get("health_overview_request"):
+        return {"citations": []}
 
     citation_text = format_citations(state.get("citations") or [])
     if not citation_text:
         return {}
 
     last_message = state["messages"][-1]
-    content = f"{last_message.content}\n\n{citation_text}"
+    # The model is instructed not to cite sources itself, but strip a citation
+    # section defensively if it still does. The application owns this section
+    # so references appear exactly once and contain retrieval-backed pages.
+    content_without_model_citations = re.split(
+        # Accept Thai headings generated in natural variants, including
+        # "การอ้างอิงจากตำรา:" seen in the UI, and optional Markdown styling.
+        r"\n\s*(?:#+\s*)?(?:\*\*)?\s*(?:(?:การ)?อ้างอิง(?:จากตำรา)?|references?)(?:\*\*)?\s*:\s*",
+        str(last_message.content),
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].rstrip()
+    content_without_model_citations = _drop_incomplete_trailing_markdown(
+        content_without_model_citations
+    )
+    content = f"{content_without_model_citations}\n\n{citation_text}"
     if hasattr(last_message, "model_copy"):
         message = last_message.model_copy(update={"content": content})
     else:

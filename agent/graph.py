@@ -14,6 +14,7 @@ from .slot_filling_graph import (
     ask_fasting_node,
     ask_gender_node,
     ask_lab_node,
+    acknowledge_profile_update_node,
     extract_info_node,
     route_after_extraction,
 )
@@ -39,6 +40,7 @@ def build_graph():
     graph.add_node("guardrail_input", guardrail_input_node)
     graph.add_node("extract_info_node", extract_info_node)
     graph.add_node("ask_lab_node", ask_lab_node)
+    graph.add_node("acknowledge_profile_update", acknowledge_profile_update_node)
     graph.add_node("ask_fasting_node", ask_fasting_node)
     graph.add_node("ask_age_node", ask_age_node)
     graph.add_node("ask_gender_node", ask_gender_node)
@@ -67,6 +69,7 @@ def build_graph():
         route_after_extraction,
         {
             "ask_lab_node": "ask_lab_node",
+            "acknowledge_profile_update": "acknowledge_profile_update",
             "ask_fasting_node": "ask_fasting_node",
             "ask_age_node": "ask_age_node",
             "ask_gender_node": "ask_gender_node",
@@ -77,6 +80,7 @@ def build_graph():
     # Question nodes finish the current turn. The next user reply re-enters
     # this graph at "input" with the accumulated chat history/state.
     graph.add_edge("ask_lab_node", END)
+    graph.add_edge("acknowledge_profile_update", END)
     graph.add_edge("ask_fasting_node", END)
     graph.add_edge("ask_age_node", END)
     graph.add_edge("ask_gender_node", END)

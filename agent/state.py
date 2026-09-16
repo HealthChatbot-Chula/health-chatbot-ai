@@ -27,6 +27,14 @@ class AgentState(TypedDict, total=False):
     fasting_status: Optional[str]  # "yes" or "no"
     extracted_lab_values: Optional[Dict[str, float]]
     pending_slot: Optional[str]
+    # True only for a turn that updates non-laboratory profile measurements
+    # without asking for an interpretation. These turns end with an
+    # acknowledgement rather than RAG.
+    profile_update_only: Optional[bool]
+    profile_update_fields: Optional[List[str]]
+    # A request for a dashboard-style health overview. It may summarize saved
+    # values, but intentionally does not display textbook citations.
+    health_overview_request: Optional[bool]
 
     # Source records for citations appended after the safety review.
     citations: Optional[List[Dict[str, object]]]

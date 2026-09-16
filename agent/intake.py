@@ -357,6 +357,21 @@ def looks_like_scope_question(text: str) -> bool:
     return any(phrase in normalized for phrase in scope_phrases)
 
 
+def is_health_overview_request(text: str) -> bool:
+    """Recognize a dashboard-style summary rather than a clinical question."""
+
+    normalized = " ".join(text.strip().lower().split())
+    overview_phrases = (
+        "ภาพรวมสุขภาพ",
+        "ภาพรวมของสุขภาพ",
+        "สรุปสุขภาพ",
+        "สรุปผลตรวจ",
+        "สรุปข้อมูลสุขภาพ",
+        "health overview",
+    )
+    return any(phrase in normalized for phrase in overview_phrases)
+
+
 def classify_interaction_intent(text: str, state: AgentState) -> str:
     normalized = text.strip().lower()
     lab_values = state.get("extracted_lab_values") or {}
