@@ -13,7 +13,8 @@ class AgentState(TypedDict, total=False):
     current_node: Optional[str]
     blocked: bool
 
-    # Intent classification.
+    # Per-turn semantic intent. It is recomputed from the latest message and is
+    # never inferred from saved laboratory values.
     intent: Optional[str]
 
     # Slot-filling / medical checkup fields.

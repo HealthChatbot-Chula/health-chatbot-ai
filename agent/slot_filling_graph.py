@@ -15,7 +15,6 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.graph import END, StateGraph
 
 from .intake import (
-    classify_interaction_intent,
     conversation_user_text,
     extract_lab_values,
     latest_user_text,
@@ -27,6 +26,7 @@ from .intake import (
     next_required_slot,
     parse_intake_updates,
 )
+from .intent_classifier import DIRECT_RESPONSE_INTENTS, classify_turn_intent_node
 from .metric_extraction import extract_metrics_with_llm
 from .state import AgentState
 
@@ -74,10 +74,6 @@ def _looks_like_greeting(text: str) -> bool:
 
 def _looks_like_scope_question(text: str) -> bool:
     return looks_like_scope_question(text)
-
-
-def _classify_interaction_intent(text: str, state: AgentState) -> str:
-    return classify_interaction_intent(text, state)
 
 
 def _intake_question_text() -> str:
@@ -220,8 +216,7 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
                 # slot got answered; leave the pending question standing.
                 extracted_updates.pop("pending_slot", None)
 
-    merged_state: AgentState = {**state, **extracted_updates}
-    intent = _classify_interaction_intent(latest_user_message, merged_state)
+    intent = state.get("intent") or "unknown"
 
     print(
         "[slot_filling] intake: "
@@ -255,6 +250,9 @@ def route_after_extraction(state: AgentState) -> str:
     latest_user_message = _latest_user_text(state.get("messages", []))
     labs = state.get("extracted_lab_values") or {}
 
+    if state.get("intent") in DIRECT_RESPONSE_INTENTS:
+        return "ask_lab_node"
+
     if state.get("profile_update_only"):
         return "acknowledge_profile_update"
 
@@ -263,12 +261,6 @@ def route_after_extraction(state: AgentState) -> str:
     # deterministic intake path.  Previously it could fall through to the
     # analyst, trigger RAG, and append irrelevant textbook citations.
     if state.get("pending_slot") == "extracted_lab_values" and not labs:
-        return "ask_lab_node"
-
-    if state.get("intent") == "general_info" and (
-        _looks_like_greeting(latest_user_message)
-        or _looks_like_scope_question(latest_user_message)
-    ):
         return "ask_lab_node"
 
     next_slot = next_required_slot(state)
@@ -303,8 +295,40 @@ def ask_lab_node(state: AgentState) -> Dict[str, Any]:
     latest_user_message = _latest_user_text(messages)
     topic_specific_question = _topic_specific_lab_question(state, messages)
     labs = state.get("extracted_lab_values") or {}
+    intent = state.get("intent")
 
-    if topic_specific_question:
+    if intent == "greeting":
+        if labs:
+            content = (
+                "สวัสดีครับ ผมยังใช้ข้อมูลผลตรวจที่คุยกันไว้เป็นบริบทได้ครับ "
+                "ถ้าอยากให้ช่วยดูค่าล่าสุดหรือถามต่อจากผลตรวจเดิม ส่งคำถามมาได้เลยครับ"
+            )
+        else:
+            content = (
+                "สวัสดีครับ ผมช่วยดูผลตรวจสุขภาพเบื้องต้นได้ครับ\n\n"
+                f"{_intake_question_text()}"
+            )
+    elif intent == "capability_question":
+        content = (
+            "ผมช่วยให้ข้อมูลเบื้องต้นและช่วยแปลผลตรวจในกลุ่มหลัก ๆ เหล่านี้ครับ:\n"
+            "- เบาหวาน\n"
+            "- ความดันโลหิตสูง\n"
+            "- ไขมันในเลือดสูง\n"
+            "- โรคไตเรื้อรัง (CKD)\n"
+            "- ภาวะที่เกี่ยวข้องกับการทำงานของตับ\n\n"
+            f"{_intake_question_text()}"
+        )
+    elif intent == "out_of_scope":
+        content = (
+            "ขออภัยครับ ผมช่วยได้เฉพาะเรื่องสุขภาพและการแปลผลตรวจสุขภาพเท่านั้น\n"
+            "หากมีคำถามเกี่ยวกับอาการ ผลแลป หรือโรคที่เกี่ยวข้อง ยินดีช่วยเสมอครับ"
+        )
+    elif intent == "unknown":
+        content = (
+            "ผมยังไม่แน่ใจว่าต้องการให้ช่วยเรื่องใดครับ "
+            "ลองส่งคำถามเกี่ยวกับอาการหรือค่าผลตรวจที่ต้องการให้ช่วยดูได้เลยครับ"
+        )
+    elif topic_specific_question:
         content = topic_specific_question
     elif _looks_like_scope_question(latest_user_message):
         content = (
@@ -412,6 +436,7 @@ def build_slot_filling_graph():
 
     graph = StateGraph(AgentState)
 
+    graph.add_node("classify_turn_intent", classify_turn_intent_node)
     graph.add_node("extract_info_node", extract_info_node)
     graph.add_node("ask_lab_node", ask_lab_node)
     graph.add_node("ask_fasting_node", ask_fasting_node)
@@ -419,7 +444,8 @@ def build_slot_filling_graph():
     graph.add_node("ask_gender_node", ask_gender_node)
     graph.add_node("our_agent", our_agent)
 
-    graph.set_entry_point("extract_info_node")
+    graph.set_entry_point("classify_turn_intent")
+    graph.add_edge("classify_turn_intent", "extract_info_node")
 
     graph.add_conditional_edges(
         "extract_info_node",

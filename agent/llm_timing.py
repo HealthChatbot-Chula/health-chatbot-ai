@@ -25,6 +25,64 @@ def _record_timing(name: str, elapsed_ms: float, **details: Any) -> None:
     )
 
 
+def _usage_metadata(response: Any) -> dict[str, int]:
+    """Normalize token counters exposed by LangChain model responses."""
+
+    usage = getattr(response, "usage_metadata", None) or {}
+    response_metadata = getattr(response, "response_metadata", None) or {}
+    token_usage = (
+        response_metadata.get("token_usage")
+        or response_metadata.get("usage_metadata")
+        or {}
+    )
+
+    prompt_tokens = (
+        usage.get("input_tokens")
+        or usage.get("prompt_tokens")
+        or token_usage.get("input_tokens")
+        or token_usage.get("prompt_tokens")
+        or token_usage.get("prompt_token_count")
+        or 0
+    )
+    completion_tokens = (
+        usage.get("output_tokens")
+        or usage.get("completion_tokens")
+        or token_usage.get("output_tokens")
+        or token_usage.get("completion_tokens")
+        or token_usage.get("candidates_token_count")
+        or 0
+    )
+    total_tokens = (
+        usage.get("total_tokens")
+        or token_usage.get("total_tokens")
+        or token_usage.get("total_token_count")
+        or int(prompt_tokens) + int(completion_tokens)
+    )
+    return {
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+        "total_tokens": int(total_tokens),
+    }
+
+
+def _record_llm_usage(usage: dict[str, int]) -> None:
+    collector = _request_timing.get()
+    if collector is None:
+        return
+    totals = collector["token_usage"]
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        totals[key] += usage.get(key, 0)
+
+
+def collected_token_usage(collector: dict[str, Any]) -> dict[str, int]:
+    usage = collector.get("token_usage") or {}
+    return {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+        "completion_tokens": int(usage.get("completion_tokens", 0)),
+        "total_tokens": int(usage.get("total_tokens", 0)),
+    }
+
+
 @contextmanager
 def timed_section(name: str, **details: Any) -> Iterator[None]:
     """Measure a non-LLM step within a request."""
@@ -42,6 +100,11 @@ def request_timing(**details: Any) -> Iterator[dict[str, Any]]:
         "request_id": uuid.uuid4().hex[:12],
         "started_at": time.perf_counter(),
         "events": [],
+        "token_usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
         **details,
     }
     token = _request_timing.set(collector)
@@ -95,9 +158,18 @@ def timed_llm_invoke(model: Any, prompt: Any, label: str) -> Any:
         raise
 
     elapsed_ms = (time.perf_counter() - start) * 1000
-    _record_timing(label, elapsed_ms, kind="llm", prompt_chars=prompt_chars, status="ok")
+    usage = _usage_metadata(response)
+    _record_llm_usage(usage)
+    _record_timing(
+        label,
+        elapsed_ms,
+        kind="llm",
+        prompt_chars=prompt_chars,
+        status="ok",
+        **usage,
+    )
     print(
         f"[LLM Timing] {label}: {elapsed_ms:.1f} ms "
-        f"(prompt_chars={prompt_chars})"
+        f"(prompt_chars={prompt_chars}, total_tokens={usage['total_tokens']})"
     )
     return response

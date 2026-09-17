@@ -156,6 +156,36 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 
 Use a new `conversation_id` for an independent latency test. Reusing the same ID intentionally preserves slot memory and may use a deterministic fast path.
 
+Every response reports provider token counts for the current request in the
+top-level `usage` object. It also includes cumulative counts for the current
+conversation under `choices[0].message.metadata.token_usage`:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 367,
+    "completion_tokens": 6,
+    "total_tokens": 373
+  },
+  "choices": [
+    {
+      "message": {
+        "metadata": {
+          "token_usage": {
+            "request": {"prompt_tokens": 367, "completion_tokens": 6, "total_tokens": 373},
+            "session": {"prompt_tokens": 1240, "completion_tokens": 91, "total_tokens": 1331}
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+The backend also prints one `[Token Usage]` log entry per request. Session totals
+are keyed by `conversation_id`, `chat_id`, or `session_id` and are held in process
+memory, so they reset whenever the backend restarts or is redeployed.
+
 ## Build the Citation Database
 
 Place the clean OCR markdown and corresponding PDFs in `raw_data/`, then run:

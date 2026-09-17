@@ -7,6 +7,7 @@ from .guardrails import (
     guardrail_output_node,
     route_after_input_guardrail,
 )
+from .intent_classifier import classify_turn_intent_node
 from .memory import input_node, summarize_conversation
 from .models import chat_model, intent_model
 from .slot_filling_graph import (
@@ -38,6 +39,7 @@ def build_graph():
 
     graph.add_node("input", input_node)
     graph.add_node("guardrail_input", guardrail_input_node)
+    graph.add_node("classify_turn_intent", classify_turn_intent_node)
     graph.add_node("extract_info_node", extract_info_node)
     graph.add_node("ask_lab_node", ask_lab_node)
     graph.add_node("acknowledge_profile_update", acknowledge_profile_update_node)
@@ -60,9 +62,10 @@ def build_graph():
         route_after_input_guardrail,
         {
             "blocked": END,
-            "continue": "extract_info_node",
+            "continue": "classify_turn_intent",
         },
     )
+    graph.add_edge("classify_turn_intent", "extract_info_node")
 
     graph.add_conditional_edges(
         "extract_info_node",

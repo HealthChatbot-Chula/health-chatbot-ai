@@ -7,7 +7,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from backend.dependencies import load_agent_resources
 from backend.openai_compat import empty_usage
 from backend.schemas import ChatRequest, Message
-from agent.llm_timing import request_timing, timed_llm_invoke, timed_section
+from agent.llm_timing import (
+    collected_token_usage,
+    request_timing,
+    timed_llm_invoke,
+    timed_section,
+)
 
 
 SLOT_FIELD_NAMES = (
@@ -24,6 +29,7 @@ SLOT_FIELD_NAMES = (
 )
 
 slot_memory_store: dict[str, dict[str, Any]] = {}
+session_usage_store: dict[str, dict[str, int]] = {}
 
 HISTORY_WINDOW_TURNS = 3
 HISTORY_WINDOW_MESSAGES = HISTORY_WINDOW_TURNS * 2
@@ -663,6 +669,7 @@ def run_chat_completion(
     *,
     is_webui_task: bool,
 ) -> tuple[str, dict[str, int], Optional[dict[str, Any]]]:
+    conversation_key_value = conversation_key(req)
     with request_timing(
         route="chat_completion",
         model=req.model,
@@ -670,14 +677,35 @@ def run_chat_completion(
         message_count=len(converted_messages),
         latest_user_chars=len(latest_user_message),
         openwebui_task=is_webui_task,
+        conversation_key=conversation_key_value,
     ) as timing:
-        return _run_chat_completion_with_timing(
+        assistant_content, _, metadata = _run_chat_completion_with_timing(
             req,
             converted_messages,
             latest_user_message,
             is_webui_task=is_webui_task,
             timing=timing,
         )
+        request_usage = collected_token_usage(timing)
+        session_usage = session_usage_store.setdefault(
+            conversation_key_value,
+            empty_usage(),
+        )
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            session_usage[key] += request_usage[key]
+
+        response_metadata = metadata or {}
+        response_metadata["token_usage"] = {
+            "request": dict(request_usage),
+            "session": dict(session_usage),
+        }
+        timing["session_token_usage"] = dict(session_usage)
+        print(
+            "[Token Usage] "
+            f"conversation={conversation_key_value!r} "
+            f"request={request_usage} session={session_usage}"
+        )
+        return assistant_content, request_usage, response_metadata
 
 
 def _run_chat_completion_with_timing(
