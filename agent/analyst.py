@@ -7,7 +7,12 @@ from langchain_core.messages import SystemMessage
 from .followups import _append_structured_followup, _next_structured_followup
 from .llm_timing import timed_llm_invoke
 from .models import chat_model
-from .prompts import health_overview_prompt, lab_prompt, no_context_prompt
+from .prompts import (
+    general_health_prompt,
+    health_overview_prompt,
+    lab_prompt,
+    no_context_prompt,
+)
 from .rag_utils import RetrievedContext, format_citations, retrieve_context
 from .state import AgentState
 
@@ -32,13 +37,6 @@ LAB_SOURCE_IDS = {
     "Systolic BP": "hypertension",
     "Diastolic BP": "hypertension",
     "Blood Pressure": "hypertension",
-}
-
-SOURCE_QUERY_TERMS = {
-    "dyslipidemia": "ไขมันในเลือด LDL HDL ไตรกลีเซอไรด์ การแปลผล",
-    "diabetes": "เบาหวาน น้ำตาลในเลือด HbA1c FBS การแปลผล",
-    "kidney": "โรคไต creatinine eGFR การแปลผล",
-    "hypertension": "ความดันโลหิต การแปลผล",
 }
 
 SOURCE_KEYWORDS = {
@@ -71,6 +69,14 @@ PRIMARY_SOURCE_KEYWORDS = {
         "ฟอกไต", "dialysis", "โพแทสเซียม", "โรคไต", "ไตเรื้อรัง",
     ),
 }
+
+EVIDENCE_BACKED_LIFESTYLE_KEYWORDS = (
+    "อาหาร", "กิน", "รับประทาน", "เมนู", "โภชนาการ",
+    "ออกกำลังกาย", "กิจกรรมทางกาย", "เดินเร็ว", "วิ่ง", "ปั่นจักรยาน",
+    "น้ำหนัก", "ลดเค็ม", "โซเดียม", "ของหวาน", "ไขมันอิ่มตัว",
+    "สูบบุหรี่", "ดูแลสุขภาพ", "ปรับพฤติกรรม", "ควบคุมสุขภาพ",
+    "diet", "exercise", "nutrition", "lifestyle", "weight",
+)
 
 
 def _analysis_slot_context(state: AgentState) -> str:
@@ -117,36 +123,56 @@ def _has_structured_health_data(state: AgentState) -> bool:
     )
 
 
-def _source_ids_for_retrieval(state: AgentState, fallback_query: str) -> list[str]:
-    labs = state.get("extracted_lab_values") or {}
-    text = fallback_query.lower()
+def _current_turn_source_ids(query: str) -> list[str]:
+    """Return only guideline domains explicitly named in the latest turn."""
+
+    text = query.lower()
     for source_id, keywords in PRIMARY_SOURCE_KEYWORDS.items():
         if any(keyword in text for keyword in keywords):
             return [source_id]
 
-    # Combine lab extraction and text rules.  This supports multi-condition
-    # questions while still routing short medical terms such as "statin".
-    source_ids = {LAB_SOURCE_IDS[name] for name in labs if name in LAB_SOURCE_IDS}
-    source_ids.update(
+    source_ids = {
         source_id
         for source_id, keywords in SOURCE_KEYWORDS.items()
         if any(keyword in text for keyword in keywords)
-    )
+    }
+    if re.search(r"\b\d{2,3}\s*/\s*\d{2,3}\b", text):
+        source_ids.add("hypertension")
     return sorted(source_ids)
 
 
-def _analysis_retrieval_query(state: AgentState, fallback_query: str) -> str:
-    labs = state.get("extracted_lab_values") or {}
-    source_ids = _source_ids_for_retrieval(state, fallback_query)
-    if not labs:
-        return fallback_query
+def _source_ids_for_retrieval(state: AgentState, fallback_query: str) -> list[str]:
+    explicit_source_ids = _current_turn_source_ids(fallback_query)
+    if explicit_source_ids:
+        return explicit_source_ids
 
-    # Keep the embedding query clinical and specific.  Previously, including
-    # every disease in one query caused cross-guideline matches for LDL.
-    query_parts = [SOURCE_QUERY_TERMS[source_id] for source_id in source_ids]
-    query_parts.append("การแปลผลตรวจสุขภาพ")
-    query_parts.extend(f"{name} {value}" for name, value in labs.items())
-    return " ".join(str(part) for part in query_parts if part)
+    # A short follow-up such as "ควรเริ่มปรับอาหารอย่างไร" may omit the lab
+    # names. In that case the saved results determine which guideline domains
+    # are relevant, but they must not broaden an explicitly scoped LDL/CKD turn.
+    labs = state.get("extracted_lab_values") or {}
+    return sorted({LAB_SOURCE_IDS[name] for name in labs if name in LAB_SOURCE_IDS})
+
+
+def _should_retrieve_for_turn(state: AgentState, latest_user_message: str) -> bool:
+    """Keep general wellness turns from inheriting stale clinical citations."""
+
+    intent = state.get("intent")
+    if intent in {"lab_interpretation", "medication_safety", "urgent_red_flag"}:
+        return True
+    if _current_turn_source_ids(latest_user_message):
+        return True
+    normalized = latest_user_message.strip().lower()
+    return bool(
+        _has_structured_health_data(state)
+        and any(term in normalized for term in EVIDENCE_BACKED_LIFESTYLE_KEYWORDS)
+    )
+
+
+def _analysis_retrieval_query(state: AgentState, fallback_query: str) -> str:
+    # Guideline filters carry the disease context. The embedding query should
+    # represent only what the user asks now; appending every saved value or the
+    # phrase "lab interpretation" overwhelms nearby food/exercise semantics.
+    return fallback_query.strip()
 
 
 def call_model(state: AgentState):
@@ -158,13 +184,17 @@ def call_model(state: AgentState):
     last_user_message = messages[-1].content
 
     is_overview = bool(state.get("health_overview_request"))
+    should_retrieve = not is_overview and _should_retrieve_for_turn(
+        state,
+        last_user_message,
+    )
     retrieval_query = _analysis_retrieval_query(state, last_user_message)
     source_ids = _source_ids_for_retrieval(state, last_user_message)
     # A dashboard-style overview is based on the user's saved measurements.
     # Do not retrieve textbook excerpts or expose citations on this route.
     retrieved = (
         RetrievedContext(context="", citations=[])
-        if is_overview
+        if not should_retrieve
         else retrieve_context(retrieval_query, source_ids=source_ids)
     )
     context = retrieved.context
@@ -172,19 +202,24 @@ def call_model(state: AgentState):
     summary_context = f"\n\nPrevious conversation summary: {summary}" if summary else ""
     summary_context += _analysis_slot_context(state)
 
-    print("=== RETRIEVAL QUERY ===", "skipped for health overview" if is_overview else retrieval_query)
-    print("=== RETRIEVAL SOURCE FILTER ===", "none" if is_overview else source_ids or "all")
+    print("=== RETRIEVAL QUERY ===", retrieval_query if should_retrieve else "skipped for this turn")
+    print(
+        "=== RETRIEVAL SOURCE FILTER ===",
+        (source_ids or "all") if should_retrieve else "none",
+    )
     print("=== CONTEXT ===", context)
 
     if is_overview:
         system_prompt = health_overview_prompt(summary_context)
-    elif context or _has_structured_health_data(state):
+    elif should_retrieve and (context or _has_structured_health_data(state)):
         if not context:
             context = (
                 "No sufficiently relevant RAG material was found. Use the structured user data above "
                 "as the primary source, and do not state that the user has not provided laboratory values."
             )
-        system_prompt = lab_prompt(context, summary_context)
+        system_prompt = lab_prompt(context, summary_context, last_user_message)
+    elif state.get("intent") == "general_health":
+        system_prompt = general_health_prompt(summary_context, last_user_message)
     else:
         system_prompt = no_context_prompt()
 
@@ -204,7 +239,7 @@ def call_model(state: AgentState):
 
     result = {
         "messages": [response],
-        "steps": state.get("steps", []) + ["retrieval", "generate"],
+        "steps": state.get("steps", []) + (["retrieval"] if should_retrieve else []) + ["generate"],
         "citations": retrieved.citations,
     }
     if pending_slot:

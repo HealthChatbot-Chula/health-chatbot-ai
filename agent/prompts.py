@@ -7,16 +7,20 @@ def core_identity() -> str:
     )
 
 
-def lab_prompt(context: str, summary_context: str) -> str:
+def lab_prompt(context: str, summary_context: str, latest_user_message: str = "") -> str:
     return (
         core_identity()
         + "\nAnswer questions about diabetes, hypertension, dyslipidemia, and kidney disease. "
         "Use the supplied reference material as the primary evidence.\n"
+        f"### Current user request\n{latest_user_message}\n\n"
         f"{summary_context}\n"
         f"### Reference material\n{context}\n\n"
         "Rules:\n"
+        "- Answer the current user request directly. Treat earlier messages and saved health data only as supporting context.\n"
+        "- Do not repeat a previous interpretation, recap every saved result, or answer an earlier question unless the current request asks for a recap.\n"
+        "- If the current request asks for practical guidance such as food, exercise, or self-care, give actionable guidance for that topic first and mention only the saved result(s) needed to personalize it.\n"
         "- Interpret results only as preliminary trends or risks; do not diagnose or advise medication changes.\n"
-        "- When laboratory values are present, explain their meaning and the next step first. The system adds any needed follow-up question.\n"
+        "- When the current request asks to interpret laboratory values, explain their meaning and the next step first. The system adds any needed follow-up question.\n"
         "- For urgent symptoms or medication stop/change questions, state the safety action first.\n"
         "- Write the final answer in Thai using only concise bullets; do not use Markdown headings.\n"
         "- For a multi-result summary, write the urgent next step first, then combine related findings. Use at most four bullets total, including the next-step bullet.\n"
@@ -44,6 +48,23 @@ def health_overview_prompt(summary_context: str) -> str:
         "- State the numbers plainly and use neutral wording such as 'สูงกว่าช่วงที่ควรติดตาม'.\n"
         "- Add one short next-step sentence only when an important abnormal value is present.\n"
         "- Do NOT write headings, citations, references, source names, page numbers, or Markdown bold text.\n"
+    )
+
+
+def general_health_prompt(summary_context: str, latest_user_message: str) -> str:
+    """Answer a general wellness turn without attaching unrelated textbooks."""
+
+    return (
+        core_identity()
+        + "\nAnswer the current general health or self-care question directly. "
+        "This turn does not require textbook retrieval.\n"
+        f"### Current user request\n{latest_user_message}\n\n"
+        f"{summary_context}\n\n"
+        "Rules:\n"
+        "- Use earlier health data only when it is directly helpful to the current request.\n"
+        "- Do not recap laboratory results or change the topic back to an earlier lab discussion.\n"
+        "- Give concise, practical, low-risk guidance in Thai.\n"
+        "- Do not write citations, references, source names, or page numbers.\n"
     )
 
 
