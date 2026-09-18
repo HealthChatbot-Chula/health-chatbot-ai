@@ -4,16 +4,17 @@ from typing import Any, Dict, Iterable, Optional
 
 from langchain_core.messages import BaseMessage
 
+from .metric_extraction import METRIC_CATALOG
 from .state import AgentState
 
 
-FASTING_REQUIRED_LABS = {"FBS", "Glucose", "Triglycerides"}
+FASTING_REQUIRED_LABS = {"FBS", "Triglycerides"}
 SAFETY_FIRST_INTENTS = {"medication_safety", "urgent_red_flag"}
 
 LAB_ALIASES = {
     "fbs": "FBS",
     "fasting blood sugar": "FBS",
-    "glucose": "Glucose",
+    "glucose": "FBS",
     "hba1c": "HbA1c",
     "a1c": "HbA1c",
     "total cholesterol": "Total Cholesterol",
@@ -35,8 +36,8 @@ LAB_ALIASES = {
 
 LAB_VALUE_PATTERNS = (
     ("FBS", r"\b(?:fbs|fasting blood sugar)\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-    ("Glucose", r"\bglucose\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-    ("Glucose", r"น้ำตาล(?:ในเลือด)?\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+    ("FBS", r"\bglucose\s*[:=]?\s*(\d+(?:\.\d+)?)"),
+    ("FBS", r"น้ำตาล(?:ในเลือด)?\s*[:=]?\s*(\d+(?:\.\d+)?)"),
     ("HbA1c", r"\b(?:hba1c|a1c)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
     ("HbA1c", r"น้ำตาลสะสม\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
     ("LDL", r"\bldl\s*[:=]?\s*(\d+(?:\.\d+)?)"),
@@ -97,9 +98,34 @@ def mentioned_lab_topics(text: str) -> list[str]:
     return topics
 
 
-def extract_lab_values(text: str, context: str = "") -> Optional[Dict[str, float]]:
+def extract_lab_values(
+    text: str,
+    context: str = "",
+    rejected: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Optional[Dict[str, float]]:
+    """
+    Deterministic, regex-based lab extraction.
+
+    A matched number that a catalog field recognizes but falls outside its
+    plausible range is never saved into the returned dict. When `rejected` is
+    passed, it is recorded there (id -> {value, min, max}) instead of being
+    silently dropped, so the caller can tell the user it was not saved.
+    """
+
     normalized_context = f"{context}\n{text}".lower()
     values: Dict[str, float] = {}
+
+    def _record(canonical_name: str, value: float) -> None:
+        definition = METRIC_CATALOG.get(canonical_name)
+        if not definition:
+            values[canonical_name] = value
+            return
+
+        _, _, minimum, maximum = definition
+        if minimum <= value <= maximum:
+            values[canonical_name] = value
+        elif rejected is not None:
+            rejected[canonical_name] = {"value": value, "min": minimum, "max": maximum}
 
     bp_match = re.search(r"(\d{2,3})\s*/\s*(\d{2,3})", text)
     if bp_match and (
@@ -107,11 +133,8 @@ def extract_lab_values(text: str, context: str = "") -> Optional[Dict[str, float
         or "bp" in normalized_context
         or "blood pressure" in normalized_context
     ):
-        sbp = float(bp_match.group(1))
-        dbp = float(bp_match.group(2))
-        if 50 <= sbp <= 260 and 30 <= dbp <= 180:
-            values["SBP"] = sbp
-            values["DBP"] = dbp
+        _record("SBP", float(bp_match.group(1)))
+        _record("DBP", float(bp_match.group(2)))
 
     thai_bp_match = re.search(
         r"ตัวบน\s*(\d{2,3}).{0,20}ตัวล่าง\s*(\d{2,3})",
@@ -119,15 +142,12 @@ def extract_lab_values(text: str, context: str = "") -> Optional[Dict[str, float
         flags=re.IGNORECASE,
     )
     if thai_bp_match:
-        sbp = float(thai_bp_match.group(1))
-        dbp = float(thai_bp_match.group(2))
-        if 50 <= sbp <= 260 and 30 <= dbp <= 180:
-            values["SBP"] = sbp
-            values["DBP"] = dbp
+        _record("SBP", float(thai_bp_match.group(1)))
+        _record("DBP", float(thai_bp_match.group(2)))
 
     for canonical_name, pattern in LAB_VALUE_PATTERNS:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            values[canonical_name] = float(match.group(1))
+            _record(canonical_name, float(match.group(1)))
 
     return values or None
 
@@ -303,10 +323,12 @@ def parse_intake_updates(state: AgentState, latest_user_message: str, context: s
     if fasting_status is not None:
         updates["fasting_status"] = fasting_status
 
-    lab_values = extract_lab_values(latest_user_message, context)
+    rejected_labs: Dict[str, Dict[str, float]] = {}
+    lab_values = extract_lab_values(latest_user_message, context, rejected=rejected_labs)
     merged_labs = merge_lab_values(state.get("extracted_lab_values"), lab_values)
     if merged_labs is not state.get("extracted_lab_values"):
         updates["extracted_lab_values"] = merged_labs
+    updates["rejected_lab_values"] = rejected_labs or None
 
     for slot_name in ("underlying_disease", "current_medications", "current_symptoms"):
         extracted_list = _list_update_from_no_phrase(latest_user_message, slot_name)
@@ -420,7 +442,7 @@ def classify_interaction_intent(text: str, state: AgentState) -> str:
     if "Potassium" in lab_values:
         return "urgent_red_flag"
 
-    glucose_value = lab_values.get("Glucose") or lab_values.get("FBS")
+    glucose_value = lab_values.get("FBS")
     if glucose_value is not None and glucose_value >= 300:
         return "urgent_red_flag"
 

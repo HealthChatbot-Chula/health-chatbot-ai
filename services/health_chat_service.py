@@ -41,7 +41,6 @@ SUMMARY_MESSAGE_CHAR_LIMIT = 1000
 FAST_PATH_PENDING_SLOTS = {"gender", "age", "fasting_status"}
 FASTING_FOLLOWUP_LABS = {
     "FBS",
-    "Glucose",
     "Triglycerides",
 }
 

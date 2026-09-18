@@ -22,9 +22,7 @@ LAB_SOURCE_IDS = {
     "Total Cholesterol": "dyslipidemia",
     "Cholesterol": "dyslipidemia",
     "FBS": "diabetes",
-    "Glucose": "diabetes",
     "HbA1c": "diabetes",
-    "2-hr PG": "diabetes",
     "SBP": "hypertension",
     "DBP": "hypertension",
     "Creatinine": "kidney",
@@ -78,6 +76,14 @@ PRIMARY_SOURCE_KEYWORDS = {
 def _analysis_slot_context(state: AgentState) -> str:
     labs = state.get("extracted_lab_values") or {}
     lab_text = ", ".join(f"{name}: {value}" for name, value in labs.items()) or "-"
+    rejected = state.get("rejected_lab_values") or {}
+    rejected_text = (
+        ", ".join(
+            f"{name}: {info['value']} (ต้องอยู่ระหว่าง {info['min']}-{info['max']})"
+            for name, info in rejected.items()
+        )
+        or "-"
+    )
     profile_metrics = state.get("profile_metrics")
     health_state = state.get("health_state")
     return (
@@ -90,6 +96,7 @@ def _analysis_slot_context(state: AgentState) -> str:
         f"\n- current_medications: {state.get('current_medications')}"
         f"\n- current_symptoms: {state.get('current_symptoms')}"
         f"\n- extracted_lab_values: {lab_text}"
+        f"\n- rejected_lab_values (NOT saved, out of plausible range): {rejected_text}"
         f"\n- profile_metrics: {_compact_json(profile_metrics) if profile_metrics else '-'}"
         f"\n- health_state: {_compact_json(health_state) if health_state else '-'}"
     )

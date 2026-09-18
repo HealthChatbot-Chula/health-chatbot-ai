@@ -1,6 +1,5 @@
 FASTING_FOLLOWUP_LABS = {
     "FBS",
-    "Glucose",
     "Triglycerides",
 }
 

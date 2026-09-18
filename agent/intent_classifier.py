@@ -133,7 +133,7 @@ def classify_turn_intent_node(state: AgentState) -> dict[str, str]:
         return {"intent": safety_intent}
 
     current_labs = extract_lab_values(latest_message, "") or {}
-    glucose_value = current_labs.get("Glucose") or current_labs.get("FBS")
+    glucose_value = current_labs.get("FBS")
     if "Potassium" in current_labs or (
         glucose_value is not None and glucose_value >= 300
     ):

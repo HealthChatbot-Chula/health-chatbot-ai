@@ -134,8 +134,8 @@ def _topic_specific_lab_question(state: AgentState, messages: List[BaseMessage])
 
     if "fbs" in topics or "hba1c" in topics:
         return (
-            f"{prefix}ขอค่าน้ำตาลที่ขึ้นในใบตรวจหน่อยครับ เช่น FBS 112, Glucose 130 "
-            "หรือ HbA1c 6.1 ถ้าเป็น FBS/Glucose บอกได้ด้วยว่าตรวจหลังงดอาหารไหมครับ"
+            f"{prefix}ขอค่าน้ำตาลที่ขึ้นในใบตรวจหน่อยครับ เช่น FBS 112 "
+            "หรือ HbA1c 6.1 ถ้าเป็น FBS บอกได้ด้วยว่าตรวจหลังงดอาหารไหมครับ"
         )
 
     if {"ldl", "hdl", "triglycerides", "cholesterol"} & set(topics):
@@ -198,7 +198,15 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
         conversation_context,
     )
 
-    model_values = extract_metrics_with_llm(latest_user_message, conversation_context)
+    model_rejected: Dict[str, Dict[str, float]] = {}
+    model_values = extract_metrics_with_llm(
+        latest_user_message, conversation_context, rejected=model_rejected
+    )
+    if model_rejected:
+        extracted_updates["rejected_lab_values"] = {
+            **(extracted_updates.get("rejected_lab_values") or {}),
+            **model_rejected,
+        }
     if model_values is not None:
         # The model read the whole sentence, so it decides for this turn. Patterns
         # cannot tell "LDL 154" from "LDL ควรต่ำกว่า 100 ไหม" and would save the
