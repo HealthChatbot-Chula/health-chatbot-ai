@@ -13,6 +13,7 @@ from agent.llm_timing import (
     timed_llm_invoke,
     timed_section,
 )
+from agent.observability import observe_chat_request
 
 
 SLOT_FIELD_NAMES = (
@@ -215,10 +216,19 @@ def is_openwebui_task(user_text: str) -> bool:
     return any(marker in user_text for marker in OPENWEBUI_TASK_MARKERS)
 
 
-def conversation_key(req: ChatRequest) -> str:
+def _fallback_request_key(req: ChatRequest) -> str:
+    first_user_message = next(
+        (message.content for message in req.messages if message.role == "user"),
+        "",
+    )
+    fingerprint_source = f"{req.user or 'anonymous'}::{first_user_message}"
+    return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+
+
+def memory_key(req: ChatRequest) -> str:
     """
-    Prefer explicit IDs from the caller. If none are available, fall back to a
-    stable fingerprint of the first user message plus the optional user field.
+    Keep conversation memory stable across monitoring sessions. Legacy callers
+    without a conversation ID retain the previous chat/session fallback.
     """
 
     direct_key = req.conversation_id or req.chat_id or req.session_id
@@ -234,12 +244,30 @@ def conversation_key(req: ChatRequest) -> str:
     if metadata_key:
         return str(metadata_key)
 
-    first_user_message = next(
-        (message.content for message in req.messages if message.role == "user"),
-        "",
+    return _fallback_request_key(req)
+
+
+def monitoring_session_key(req: ChatRequest) -> str:
+    """Prefer the explicit usage session while supporting legacy clients."""
+
+    direct_key = req.session_id or req.conversation_id or req.chat_id
+    if direct_key:
+        return direct_key
+
+    metadata = req.metadata or {}
+    metadata_key = (
+        metadata.get("session_id")
+        or metadata.get("conversation_id")
+        or metadata.get("chat_id")
     )
-    fingerprint_source = f"{req.user or 'anonymous'}::{first_user_message}"
-    return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+    if metadata_key:
+        return str(metadata_key)
+
+    return _fallback_request_key(req)
+
+
+# Backward-compatible alias for internal tools importing the old helper.
+conversation_key = memory_key
 
 
 def request_extra_fields(req: ChatRequest) -> dict[str, Any]:
@@ -668,43 +696,64 @@ def run_chat_completion(
     *,
     is_webui_task: bool,
 ) -> tuple[str, dict[str, int], Optional[dict[str, Any]]]:
-    conversation_key_value = conversation_key(req)
-    with request_timing(
-        route="chat_completion",
+    conversation_key_value = memory_key(req)
+    session_key_value = monitoring_session_key(req)
+    with observe_chat_request(
+        user_id=req.user,
+        session_id=session_key_value,
+        conversation_id=conversation_key_value,
         model=req.model,
-        stream_requested=bool(req.stream),
         message_count=len(converted_messages),
         latest_user_chars=len(latest_user_message),
-        openwebui_task=is_webui_task,
-        conversation_key=conversation_key_value,
-    ) as timing:
-        assistant_content, _, metadata = _run_chat_completion_with_timing(
-            req,
-            converted_messages,
-            latest_user_message,
-            is_webui_task=is_webui_task,
-            timing=timing,
-        )
-        request_usage = collected_token_usage(timing)
-        session_usage = session_usage_store.setdefault(
-            conversation_key_value,
-            empty_usage(),
-        )
-        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            session_usage[key] += request_usage[key]
+    ) as trace:
+        with request_timing(
+            route="chat_completion",
+            model=req.model,
+            stream_requested=bool(req.stream),
+            message_count=len(converted_messages),
+            latest_user_chars=len(latest_user_message),
+            openwebui_task=is_webui_task,
+            conversation_key=conversation_key_value,
+            session_key=session_key_value,
+        ) as timing:
+            assistant_content, _, metadata = _run_chat_completion_with_timing(
+                req,
+                converted_messages,
+                latest_user_message,
+                is_webui_task=is_webui_task,
+                timing=timing,
+            )
+            request_usage = collected_token_usage(timing)
+            session_usage = session_usage_store.setdefault(
+                session_key_value,
+                empty_usage(),
+            )
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                session_usage[key] += request_usage[key]
 
-        response_metadata = metadata or {}
-        response_metadata["token_usage"] = {
-            "request": dict(request_usage),
-            "session": dict(session_usage),
-        }
-        timing["session_token_usage"] = dict(session_usage)
-        print(
-            "[Token Usage] "
-            f"conversation={conversation_key_value!r} "
-            f"request={request_usage} session={session_usage}"
-        )
-        return assistant_content, request_usage, response_metadata
+            response_metadata = metadata or {}
+            response_metadata["token_usage"] = {
+                "request": dict(request_usage),
+                "session": dict(session_usage),
+            }
+            timing["session_token_usage"] = dict(session_usage)
+            trace.update(
+                output={"response_chars": len(str(assistant_content))},
+                metadata={
+                    "conversation_id": conversation_key_value,
+                    "session_id": session_key_value,
+                    "execution_path": timing.get("path"),
+                    "request_token_usage": dict(request_usage),
+                    "runtime_session_token_usage": dict(session_usage),
+                },
+            )
+            print(
+                "[Token Usage] "
+                f"conversation={conversation_key_value!r} "
+                f"session={session_key_value!r} "
+                f"request={request_usage} session_total={session_usage}"
+            )
+            return assistant_content, request_usage, response_metadata
 
 
 def _run_chat_completion_with_timing(
@@ -737,7 +786,7 @@ def _run_chat_completion_with_timing(
         return assistant_content, usage_data, None
 
     print("\n[Interceptor] Normal user message detected. Routing to LangGraph.")
-    conversation_key_value = conversation_key(req)
+    conversation_key_value = memory_key(req)
     request_state = _request_health_state(req)
     if request_state:
         slot_memory_store[conversation_key_value] = _merge_slot_state(

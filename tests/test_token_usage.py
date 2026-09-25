@@ -1,5 +1,6 @@
+import os
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agent.llm_timing import collected_token_usage, request_timing, timed_llm_invoke
 
@@ -25,10 +26,11 @@ class TokenUsageTests(unittest.TestCase):
         model = Mock()
         model.invoke.side_effect = [first_response, second_response]
 
-        with request_timing(route="test") as timing:
-            timed_llm_invoke(model, "one", "first")
-            timed_llm_invoke(model, "two", "second")
-            usage = collected_token_usage(timing)
+        with patch.dict(os.environ, {"LANGFUSE_ENABLED": "false"}):
+            with request_timing(route="test") as timing:
+                timed_llm_invoke(model, "one", "first")
+                timed_llm_invoke(model, "two", "second")
+                usage = collected_token_usage(timing)
 
         self.assertEqual(
             usage,

@@ -8,5 +8,6 @@ langchain-chroma
 sentence-transformers
 python-dotenv
 langchain-google-vertexai
+langfuse>=4.7,<5
 google-cloud-aiplatform
 google-auth

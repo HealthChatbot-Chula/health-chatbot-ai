@@ -20,6 +20,7 @@ An OpenAI-compatible Thai health-information chatbot for preliminary checkup-res
 - Input relevance checks, safety-sensitive output review, and follow-up slot handling.
 - Startup warm-up for LangGraph, Chroma, and BGE-M3 to avoid first-request retrieval latency.
 - Request timing logs for resource loading, retrieval, LLM generation, graph invocation, and total latency.
+- Optional Langfuse traces grouped by monitoring session, with per-generation token usage.
 - Built-in multi-turn patient simulator and LLM judge.
 
 ## Request Flow
@@ -131,6 +132,11 @@ Wait for this startup message before measuring warm-request latency:
 | `GCP_CREDS_JSON` | unset | Service-account JSON for deployed environments. |
 | `HEALTH_CHAT_MODEL` | `gemini-2.5-flash-lite` | Model used for health answers and safety review. Set to `gemini-2.5-flash` to use the larger model. |
 | `WARM_RAG_ON_STARTUP` | `true` | Set to `false` to disable graph/RAG startup warm-up. |
+| `LANGFUSE_ENABLED` | `false` | Set to `true` to emit privacy-minimized chat traces. |
+| `LANGFUSE_PUBLIC_KEY` | unset | Langfuse project public key. |
+| `LANGFUSE_SECRET_KEY` | unset | Langfuse project secret key. |
+| `LANGFUSE_BASE_URL` | Langfuse EU Cloud | Langfuse Cloud region or self-hosted base URL. |
+| `LANGFUSE_TRACING_ENVIRONMENT` | `default` | Environment attached to Langfuse observations, such as `production` or `staging`. |
 
 ## API
 
@@ -150,11 +156,16 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
     "messages": [
       {"role": "user", "content": "LDL 178 สูงไหม ต้องทำอย่างไร"}
     ],
-    "conversation_id": "demo-001"
+    "conversation_id": "demo-001",
+    "session_id": "usage-session-001"
   }'
 ```
 
-Use a new `conversation_id` for an independent latency test. Reusing the same ID intentionally preserves slot memory and may use a deterministic fast path.
+`conversation_id` owns conversation history, summaries, and slot memory. Reusing it
+preserves chatbot context. `session_id` is an independent monitoring boundary used
+for Langfuse grouping and runtime token totals. A single conversation can therefore
+continue across multiple monitoring sessions without losing history. Legacy clients
+that omit `session_id` fall back to `conversation_id`.
 
 Every response reports provider token counts for the current request in the
 top-level `usage` object. It also includes cumulative counts for the current
@@ -182,9 +193,16 @@ conversation under `choices[0].message.metadata.token_usage`:
 }
 ```
 
-The backend also prints one `[Token Usage]` log entry per request. Session totals
-are keyed by `conversation_id`, `chat_id`, or `session_id` and are held in process
-memory, so they reset whenever the backend restarts or is redeployed.
+The backend also prints one `[Token Usage]` log entry per request. Runtime session
+totals prefer `session_id`, then fall back to `conversation_id` or `chat_id`. These
+totals are held in process memory, so they reset whenever the backend restarts or is
+redeployed. Langfuse is the durable source for cross-worker and cross-deployment
+usage analytics.
+
+When Langfuse is enabled, one `health-chat-turn` trace is created per request and
+LLM calls are recorded as child generations. By default, observations include IDs,
+token usage, execution metadata, and character counts only; raw health prompts and
+responses are not sent to Langfuse by this instrumentation.
 
 ## Build the Citation Database
 

@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
 
+from agent.observability import observe_generation
+
 
 _request_timing: ContextVar[dict[str, Any] | None] = ContextVar(
     "request_timing", default=None
@@ -146,30 +148,49 @@ def prompt_char_count(prompt: Any) -> int:
 def timed_llm_invoke(model: Any, prompt: Any, label: str) -> Any:
     start = time.perf_counter()
     prompt_chars = prompt_char_count(prompt)
-    try:
-        response = model.invoke(prompt)
-    except Exception:
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        _record_timing(label, elapsed_ms, kind="llm", prompt_chars=prompt_chars, status="failed")
-        print(
-            f"[LLM Timing] {label}: failed after {elapsed_ms:.1f} ms "
-            f"(prompt_chars={prompt_chars})"
-        )
-        raise
-
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    usage = _usage_metadata(response)
-    _record_llm_usage(usage)
-    _record_timing(
-        label,
-        elapsed_ms,
-        kind="llm",
+    with observe_generation(
+        name=label,
+        model=model,
         prompt_chars=prompt_chars,
-        status="ok",
-        **usage,
-    )
-    print(
-        f"[LLM Timing] {label}: {elapsed_ms:.1f} ms "
-        f"(prompt_chars={prompt_chars}, total_tokens={usage['total_tokens']})"
-    )
-    return response
+    ) as generation:
+        try:
+            response = model.invoke(prompt)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            _record_timing(
+                label,
+                elapsed_ms,
+                kind="llm",
+                prompt_chars=prompt_chars,
+                status="failed",
+            )
+            print(
+                f"[LLM Timing] {label}: failed after {elapsed_ms:.1f} ms "
+                f"(prompt_chars={prompt_chars})"
+            )
+            raise
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        usage = _usage_metadata(response)
+        _record_llm_usage(usage)
+        _record_timing(
+            label,
+            elapsed_ms,
+            kind="llm",
+            prompt_chars=prompt_chars,
+            status="ok",
+            **usage,
+        )
+        generation.update(
+            output={"response_chars": _content_char_count(response)},
+            usage_details={
+                "input": usage["prompt_tokens"],
+                "output": usage["completion_tokens"],
+                "total": usage["total_tokens"],
+            },
+        )
+        print(
+            f"[LLM Timing] {label}: {elapsed_ms:.1f} ms "
+            f"(prompt_chars={prompt_chars}, total_tokens={usage['total_tokens']})"
+        )
+        return response

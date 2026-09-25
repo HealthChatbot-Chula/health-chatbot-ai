@@ -8,6 +8,7 @@ from backend.routes import chat
 from backend.routes import eval as eval_routes
 from backend.dependencies import load_agent_resources
 from agent.rag_utils import warm_retrieval_resources
+from agent.observability import shutdown_langfuse
 
 
 app = FastAPI()
@@ -28,6 +29,13 @@ async def warm_health_agent() -> None:
         # A temporary model/database issue must not prevent FastAPI from
         # starting; the normal lazy path remains available and logs its error.
         print(f"[Startup Warmup] Skipped: {exc}")
+
+
+@app.on_event("shutdown")
+async def flush_observability() -> None:
+    """Flush queued Langfuse events without delaying normal chat requests."""
+
+    await asyncio.to_thread(shutdown_langfuse)
 
 # Allow OpenWebUI or local clients to call the OpenAI-compatible endpoints.
 app.add_middleware(
