@@ -133,6 +133,7 @@ Wait for this startup message before measuring warm-request latency:
 | `HEALTH_CHAT_MODEL` | `gemini-2.5-flash-lite` | Model used for health answers and safety review. Set to `gemini-2.5-flash` to use the larger model. |
 | `WARM_RAG_ON_STARTUP` | `true` | Set to `false` to disable graph/RAG startup warm-up. |
 | `LANGFUSE_ENABLED` | `false` | Set to `true` to emit privacy-minimized chat traces. |
+| `LANGFUSE_CAPTURE_CONTENT` | `false` | Set to `true` to include masked, truncated user messages, assistant answers, and per-generation prompt/output messages in Langfuse. Common direct identifiers (email, phone, Thai national ID, URL, IP address, and dates) are redacted. Review this setting with your privacy policy before enabling it. |
 | `LANGFUSE_PUBLIC_KEY` | unset | Langfuse project public key. |
 | `LANGFUSE_SECRET_KEY` | unset | Langfuse project secret key. |
 | `LANGFUSE_BASE_URL` | Langfuse EU Cloud | Langfuse Cloud region or self-hosted base URL. |
@@ -202,7 +203,11 @@ usage analytics.
 When Langfuse is enabled, one `health-chat-turn` trace is created per request and
 LLM calls are recorded as child generations. By default, observations include IDs,
 token usage, execution metadata, and character counts only; raw health prompts and
-responses are not sent to Langfuse by this instrumentation.
+responses are not sent to Langfuse by this instrumentation. Set
+`LANGFUSE_CAPTURE_CONTENT=true` to add bounded, masked, role-labelled messages to
+the root trace and each LLM generation. This is still not a guarantee that every
+personal identifier is removed, so enable it only when your privacy and
+data-retention policies permit it.
 
 ## Build the Citation Database
 

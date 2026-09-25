@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -20,6 +22,80 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def langfuse_enabled() -> bool:
     return _env_flag("LANGFUSE_ENABLED")
+
+
+def langfuse_content_capture_enabled() -> bool:
+    """Return whether masked chat content may be sent to Langfuse.
+
+    This is deliberately a separate opt-in from general tracing because this
+    application handles health-related conversations.
+    """
+
+    return _env_flag("LANGFUSE_CAPTURE_CONTENT")
+
+
+_CONTENT_MAX_CHARS = 2_000
+_SENSITIVE_CONTENT_PATTERNS = (
+    # Thai national ID numbers, with or without the usual separators.
+    (re.compile(r"(?<!\d)(?:\d[- ]?){12}\d(?!\d)"), "[REDACTED_NATIONAL_ID]"),
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[REDACTED_EMAIL]"),
+    # ISO and common day/month/year date forms can identify a patient when
+    # combined with the surrounding conversation. This must run before the
+    # phone matcher because its separators resemble phone-number formatting.
+    (
+        re.compile(r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b"),
+        "[REDACTED_DATE]",
+    ),
+    # International numbers plus common Thai local mobile/landline forms.
+    (
+        re.compile(
+            r"(?<!\w)(?:\+\d{1,3}[ -]?)?(?:\(?\d{2,3}\)?[ -]?){2,4}\d{3,4}(?!\w)"
+        ),
+        "[REDACTED_PHONE]",
+    ),
+    (re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE), "[REDACTED_URL]"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
+)
+
+
+def sanitize_langfuse_content(value: Any) -> str:
+    """Mask common direct identifiers before optional Langfuse capture."""
+
+    content = str(value)
+    for pattern, replacement in _SENSITIVE_CONTENT_PATTERNS:
+        content = pattern.sub(replacement, content)
+    if len(content) > _CONTENT_MAX_CHARS:
+        content = f"{content[:_CONTENT_MAX_CHARS]}… [TRUNCATED]"
+    return content
+
+
+def _langfuse_message_role(message: Any) -> str:
+    message_type = str(getattr(message, "type", "")).lower()
+    return {
+        "human": "user",
+        "ai": "assistant",
+        "system": "system",
+    }.get(message_type, "user")
+
+
+def _langfuse_message_content(value: Any) -> str:
+    content = getattr(value, "content", value)
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def sanitized_langfuse_messages(prompt: Any) -> list[dict[str, str]]:
+    """Return a bounded, role-labelled, masked representation of an LLM prompt."""
+
+    messages = prompt if isinstance(prompt, (list, tuple)) else [prompt]
+    return [
+        {
+            "role": _langfuse_message_role(message),
+            "content": sanitize_langfuse_content(_langfuse_message_content(message)),
+        }
+        for message in messages
+    ]
 
 
 def _report_error(stage: str, exc: BaseException) -> None:
@@ -72,8 +148,14 @@ def observe_chat_request(
     model: str,
     message_count: int,
     latest_user_chars: int,
+    latest_user_message: str,
 ) -> Iterator[ObservationHandle]:
-    """Create one privacy-minimized Langfuse trace for a chatbot turn."""
+    """Create one Langfuse trace for a chatbot turn.
+
+    Raw health content is never captured. When explicitly opted in, the root
+    trace includes a bounded, masked copy of the latest user message and final
+    assistant answer to make trace review useful without exposing common IDs.
+    """
 
     if not langfuse_enabled():
         yield ObservationHandle()
@@ -89,19 +171,6 @@ def observe_chat_request(
     attributes_context = None
     try:
         client = get_client()
-        span_context = client.start_as_current_observation(
-            as_type="span",
-            name="health-chat-turn",
-            input={
-                "message_count": message_count,
-                "latest_user_chars": latest_user_chars,
-            },
-            metadata={
-                "conversation_id": conversation_id,
-                "requested_model": model,
-            },
-        )
-        span = _enter_context(span_context)
         propagated_attributes = {
             "session_id": session_id,
             "tags": ["health-chat"],
@@ -110,8 +179,37 @@ def observe_chat_request(
         }
         if user_id:
             propagated_attributes["user_id"] = user_id
+        # Attribute propagation must be active before the root observation is
+        # created. Langfuse uses every observation carrying session_id to build
+        # correct session-level metrics, including total token usage.
         attributes_context = propagate_attributes(**propagated_attributes)
         _enter_context(attributes_context)
+
+        trace_input: Any = {
+            "message_count": message_count,
+            "latest_user_chars": latest_user_chars,
+        }
+        if langfuse_content_capture_enabled():
+            trace_input = [
+                {
+                    "role": "user",
+                    "content": sanitize_langfuse_content(latest_user_message),
+                }
+            ]
+
+        span_context = client.start_as_current_observation(
+            as_type="span",
+            name="health-chat-turn",
+            input=trace_input,
+            metadata={
+                "conversation_id": conversation_id,
+                "requested_model": model,
+                "message_count": message_count,
+                "latest_user_chars": latest_user_chars,
+                "content_capture": langfuse_content_capture_enabled(),
+            },
+        )
+        span = _enter_context(span_context)
     except Exception as exc:
         _report_error("trace setup", exc)
         if attributes_context is not None:
@@ -130,8 +228,8 @@ def observe_chat_request(
         raise
     finally:
         _active_chat_trace.reset(token)
-        _exit_context(attributes_context, exc_info)
         _exit_context(span_context, exc_info)
+        _exit_context(attributes_context, exc_info)
 
 
 def _model_name(model: Any) -> str:
@@ -148,6 +246,7 @@ def observe_generation(
     name: str,
     model: Any,
     prompt_chars: int,
+    prompt: Any,
 ) -> Iterator[ObservationHandle]:
     """Create a generation only while a chat request trace is active."""
 
@@ -163,11 +262,14 @@ def observe_generation(
     get_client, _ = sdk
     generation_context = None
     try:
+        generation_input: Any = {"prompt_chars": prompt_chars}
+        if langfuse_content_capture_enabled():
+            generation_input = sanitized_langfuse_messages(prompt)
         generation_context = get_client().start_as_current_observation(
             as_type="generation",
             name=name,
             model=_model_name(model),
-            input={"prompt_chars": prompt_chars},
+            input=generation_input,
         )
         generation = _enter_context(generation_context)
     except Exception as exc:

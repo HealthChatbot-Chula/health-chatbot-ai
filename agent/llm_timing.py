@@ -5,7 +5,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
 
-from agent.observability import observe_generation
+from agent.observability import (
+    _langfuse_message_content,
+    langfuse_content_capture_enabled,
+    observe_generation,
+    sanitize_langfuse_content,
+)
 
 
 _request_timing: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -152,6 +157,7 @@ def timed_llm_invoke(model: Any, prompt: Any, label: str) -> Any:
         name=label,
         model=model,
         prompt_chars=prompt_chars,
+        prompt=prompt,
     ) as generation:
         try:
             response = model.invoke(prompt)
@@ -181,8 +187,18 @@ def timed_llm_invoke(model: Any, prompt: Any, label: str) -> Any:
             status="ok",
             **usage,
         )
+        generation_output: Any = {"response_chars": _content_char_count(response)}
+        if langfuse_content_capture_enabled():
+            generation_output = [
+                {
+                    "role": "assistant",
+                    "content": sanitize_langfuse_content(
+                        _langfuse_message_content(response)
+                    ),
+                }
+            ]
         generation.update(
-            output={"response_chars": _content_char_count(response)},
+            output=generation_output,
             usage_details={
                 "input": usage["prompt_tokens"],
                 "output": usage["completion_tokens"],

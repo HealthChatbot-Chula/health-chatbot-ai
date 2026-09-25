@@ -13,7 +13,11 @@ from agent.llm_timing import (
     timed_llm_invoke,
     timed_section,
 )
-from agent.observability import observe_chat_request
+from agent.observability import (
+    langfuse_content_capture_enabled,
+    observe_chat_request,
+    sanitize_langfuse_content,
+)
 
 
 SLOT_FIELD_NAMES = (
@@ -705,6 +709,7 @@ def run_chat_completion(
         model=req.model,
         message_count=len(converted_messages),
         latest_user_chars=len(latest_user_message),
+        latest_user_message=latest_user_message,
     ) as trace:
         with request_timing(
             route="chat_completion",
@@ -737,8 +742,16 @@ def run_chat_completion(
                 "session": dict(session_usage),
             }
             timing["session_token_usage"] = dict(session_usage)
+            trace_output: Any = {"response_chars": len(str(assistant_content))}
+            if langfuse_content_capture_enabled():
+                trace_output = [
+                    {
+                        "role": "assistant",
+                        "content": sanitize_langfuse_content(assistant_content),
+                    }
+                ]
             trace.update(
-                output={"response_chars": len(str(assistant_content))},
+                output=trace_output,
                 metadata={
                     "conversation_id": conversation_key_value,
                     "session_id": session_key_value,
