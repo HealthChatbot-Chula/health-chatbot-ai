@@ -121,7 +121,12 @@ def build_processed_markdown() -> list[Path]:
         output_path = PROCESSED_DIR / filename
 
         if not input_path.exists():
-            print(f"WARNING: file not found: {input_path}")
+            if output_path.exists():
+                processed_files.append(output_path)
+                print(f"Using existing processed file: {output_path}")
+                continue
+
+            print(f"WARNING: file not found: {input_path} or {output_path}")
             continue
 
         preprocess_file(

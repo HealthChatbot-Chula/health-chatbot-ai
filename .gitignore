@@ -6,8 +6,8 @@ __pycache__/
 .DS_store
 
 # Chroma DB / vector store
-chroma_db_health/
-*.bin
-*.sqlite3
+/chroma_db_health/
 
 key.json
+
+raw_data/**

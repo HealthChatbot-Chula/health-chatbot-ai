@@ -9,106 +9,40 @@ directly, or composed into a larger application graph later.
 from __future__ import annotations
 
 import json
-import os
-import re
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.graph import END, StateGraph
 
+from .intake import (
+    conversation_user_text,
+    extract_lab_values,
+    latest_user_text,
+    looks_like_greeting,
+    is_health_overview_request,
+    looks_like_scope_question,
+    mentioned_lab_topics,
+    needs_fasting_status,
+    next_required_slot,
+    parse_intake_updates,
+)
+from .intent_classifier import DIRECT_RESPONSE_INTENTS, classify_turn_intent_node
+from .metric_extraction import extract_metrics_with_llm
 from .state import AgentState
 
-try:
-    from langchain_google_vertexai import ChatVertexAI
-except ImportError:  # pragma: no cover - depends on deployment extras
-    ChatVertexAI = None  # type: ignore[assignment]
 
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-except ImportError:  # pragma: no cover - depends on deployment extras
-    ChatGoogleGenerativeAI = None  # type: ignore[assignment]
-
-
-CRITICAL_LAB_ALIASES = {
-    "fbs": "FBS",
-    "fasting blood sugar": "FBS",
-    "glucose": "Glucose",
-    "hba1c": "HbA1c",
-    "a1c": "HbA1c",
-    "total cholesterol": "Total Cholesterol",
-    "cholesterol": "Total Cholesterol",
-    "hdl": "HDL",
-    "ldl": "LDL",
-    "triglyceride": "Triglycerides",
-    "triglycerides": "Triglycerides",
-    "creatinine": "Creatinine",
-    "egfr": "eGFR",
-    "bun": "BUN",
-    "bp": "Blood Pressure",
-    "blood pressure": "Blood Pressure",
-    "systolic": "SBP",
-    "sbp": "SBP",
-    "diastolic": "DBP",
-    "dbp": "DBP",
-    "ความดันตัวบน": "SBP",
-    "ความดันตัวล่าง": "DBP",
-    "k": "Potassium",
-    "potassium": "Potassium",
-    "ast": "AST",
-    "alt": "ALT",
+_PROFILE_ONLY_METRICS = {
+    "Height", "Weight", "BMI", "WaistCircumference", "HeartRate",
 }
-
-FASTING_RELEVANT_LABS = {
-    "FBS",
-    "Glucose",
-    "Total Cholesterol",
-    "HDL",
-    "LDL",
-    "Triglycerides",
+_PROFILE_METRIC_LABELS = {
+    "Height": "ส่วนสูง", "Weight": "น้ำหนัก", "BMI": "BMI",
+    "WaistCircumference": "รอบเอว", "HeartRate": "ชีพจร",
 }
-
-SAFETY_FIRST_INTENTS = {"medication_safety", "urgent_red_flag"}
-
-
-def _get_extraction_llm():
-    """
-    Lazily create the extraction model.
-
-    Defaults to Vertex AI because this project already depends on
-    langchain-google-vertexai. Set SLOT_FILLING_LLM_PROVIDER=google_genai to use
-    ChatGoogleGenerativeAI instead.
-    """
-
-    provider = os.getenv("SLOT_FILLING_LLM_PROVIDER", "vertex").strip().lower()
-    model_name = os.getenv("SLOT_FILLING_MODEL", "gemini-2.5-flash-lite")
-
-    if provider in {"google_genai", "google-generative-ai", "genai"}:
-        if ChatGoogleGenerativeAI is None:
-            raise RuntimeError(
-                "langchain-google-genai is not installed. Install it or use "
-                "SLOT_FILLING_LLM_PROVIDER=vertex."
-            )
-        return ChatGoogleGenerativeAI(model=model_name, temperature=0)
-
-    if ChatVertexAI is None:
-        raise RuntimeError(
-            "langchain-google-vertexai is not installed. Install it or use "
-            "SLOT_FILLING_LLM_PROVIDER=google_genai."
-        )
-
-    return ChatVertexAI(model=model_name, temperature=0)
 
 
 def _latest_user_text(messages: List[BaseMessage]) -> str:
     """Return the latest human message content, or an empty string."""
-
-    for message in reversed(messages):
-        if isinstance(message, HumanMessage) or getattr(message, "type", None) == "human":
-            content = message.content
-            if isinstance(content, str):
-                return content
-            return json.dumps(content, ensure_ascii=False)
-    return ""
+    return latest_user_text(messages)
 
 
 def _latest_assistant_text_before_latest_user(messages: List[BaseMessage]) -> str:
@@ -135,95 +69,11 @@ def _latest_assistant_text_before_latest_user(messages: List[BaseMessage]) -> st
 
 
 def _looks_like_greeting(text: str) -> bool:
-    normalized = text.strip().lower()
-    if not normalized:
-        return False
-    return normalized in {
-        "สวัสดี",
-        "สวัสดีครับ",
-        "สวัสดีค่ะ",
-        "หวัดดี",
-        "หวัดดีครับ",
-        "หวัดดีค่ะ",
-        "hello",
-        "hi",
-    }
+    return looks_like_greeting(text)
 
 
 def _looks_like_scope_question(text: str) -> bool:
-    normalized = text.strip().lower()
-    scope_phrases = (
-        "โรคอะไร",
-        "โรคอะไรได้บ้าง",
-        "ช่วยอะไรได้บ้าง",
-        "ทำอะไรได้บ้าง",
-        "ให้ข้อมูลเกี่ยวกับ",
-        "ขอบเขต",
-        "scope",
-        "capability",
-    )
-    return any(phrase in normalized for phrase in scope_phrases)
-
-
-def _classify_interaction_intent(text: str, state: AgentState) -> str:
-    normalized = text.strip().lower()
-    lab_values = state.get("extracted_lab_values") or {}
-
-    medication_terms = (
-        "หยุดยา",
-        "หยุดยาเอง",
-        "ลดยา",
-        "เพิ่มยา",
-        "ปรับยา",
-        "กินยา",
-        "ยาความดัน",
-        "ยาเบาหวาน",
-        "ยาไต",
-        "ยามันทำให้",
-        "ต้องหยุดไหม",
-        "หยุดไหม",
-        "หยุดได้ไหม",
-        "ไม่กินยา",
-    )
-    if any(term in normalized for term in medication_terms):
-        return "medication_safety"
-
-    urgent_terms = (
-        "เจ็บหน้าอก",
-        "หอบ",
-        "หายใจไม่ออก",
-        "หมดสติ",
-        "ซึม",
-        "ชัก",
-        "เวียนหัวมาก",
-        "มึนหัวมาก",
-        "อ่อนเพลียมาก",
-        "ปากแห้ง",
-        "ปัสสาวะบ่อย",
-        "รอดู",
-        "ไปพรุ่งนี้",
-        "ฉุกเฉิน",
-    )
-    if any(term in normalized for term in urgent_terms):
-        return "urgent_red_flag"
-
-    if any(name in lab_values for name in {"Potassium", "K"}):
-        return "urgent_red_flag"
-
-    glucose_value = lab_values.get("Glucose") or lab_values.get("FBS")
-    if glucose_value is not None and glucose_value >= 300:
-        return "urgent_red_flag"
-
-    if lab_values:
-        return "lab_interpretation"
-
-    if _mentioned_lab_topics(normalized):
-        return "lab_interpretation"
-
-    if _looks_like_greeting(normalized) or _looks_like_scope_question(normalized):
-        return "general_info"
-
-    return state.get("intent") or "general_health"
+    return looks_like_scope_question(text)
 
 
 def _intake_question_text() -> str:
@@ -235,77 +85,15 @@ def _intake_question_text() -> str:
 
 
 def _conversation_user_text(messages: List[BaseMessage]) -> str:
-    parts: List[str] = []
-    for message in messages:
-        if isinstance(message, HumanMessage) or getattr(message, "type", None) == "human":
-            content = message.content
-            if isinstance(content, str):
-                parts.append(content)
-            else:
-                parts.append(json.dumps(content, ensure_ascii=False))
-    return "\n".join(parts)
+    return conversation_user_text(messages)
 
 
 def _mentioned_lab_topics(text: str) -> List[str]:
-    normalized = text.strip().lower()
-    topics: List[str] = []
-
-    topic_patterns = [
-        ("blood_pressure", ("ความดัน", "ค่าความดัน", "bp", "blood pressure")),
-        ("ldl", ("ldl",)),
-        ("hdl", ("hdl",)),
-        ("triglycerides", ("triglyceride", "triglycerides", "ไตรกลีเซอไรด์", "ไขมัน")),
-        ("hba1c", ("hba1c", "a1c", "น้ำตาลสะสม")),
-        ("fbs", ("fbs", "น้ำตาล", "glucose")),
-        ("egfr", ("egfr", "ค่าไต")),
-        ("creatinine", ("creatinine", "ครีเอตินิน")),
-        ("alt_ast", ("alt", "ast", "ค่าตับ")),
-        ("cholesterol", ("cholesterol", "คอเลสเตอรอล")),
-    ]
-
-    for topic, patterns in topic_patterns:
-        if any(pattern in normalized for pattern in patterns):
-            topics.append(topic)
-
-    return topics
+    return mentioned_lab_topics(text)
 
 
 def _extract_lab_values_from_text(text: str, context: str = "") -> Optional[Dict[str, float]]:
-    normalized_context = f"{context}\n{text}".lower()
-    values: Dict[str, float] = {}
-
-    bp_match = re.search(r"(\d{2,3})\s*/\s*(\d{2,3})", text)
-    if bp_match and (
-        "ความดัน" in normalized_context
-        or "bp" in normalized_context
-        or "blood pressure" in normalized_context
-    ):
-        sbp = float(bp_match.group(1))
-        dbp = float(bp_match.group(2))
-        if 50 <= sbp <= 260 and 30 <= dbp <= 180:
-            values["SBP"] = sbp
-            values["DBP"] = dbp
-
-    named_patterns = [
-        ("FBS", r"\b(?:fbs|fasting blood sugar)\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("Glucose", r"\bglucose\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("HbA1c", r"\b(?:hba1c|a1c)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?"),
-        ("LDL", r"\bldl\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("HDL", r"\bhdl\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("Triglycerides", r"\b(?:tg|triglycerides?|ไตรกลีเซอไรด์)\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("Total Cholesterol", r"\b(?:total cholesterol|cholesterol)\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("eGFR", r"\begfr\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("Creatinine", r"\bcreatinine\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("ALT", r"\balt\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-        ("AST", r"\bast\s*[:=]?\s*(\d+(?:\.\d+)?)"),
-    ]
-
-    for canonical_name, pattern in named_patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            values[canonical_name] = float(match.group(1))
-
-    return values or None
+    return extract_lab_values(text, context)
 
 
 def _known_profile_phrase(state: AgentState) -> str:
@@ -346,8 +134,8 @@ def _topic_specific_lab_question(state: AgentState, messages: List[BaseMessage])
 
     if "fbs" in topics or "hba1c" in topics:
         return (
-            f"{prefix}ขอค่าน้ำตาลที่ขึ้นในใบตรวจหน่อยครับ เช่น FBS 112, Glucose 130 "
-            "หรือ HbA1c 6.1 ถ้าเป็น FBS/Glucose บอกได้ด้วยว่าตรวจหลังงดอาหารไหมครับ"
+            f"{prefix}ขอค่าน้ำตาลที่ขึ้นในใบตรวจหน่อยครับ เช่น FBS 112 "
+            "หรือ HbA1c 6.1 ถ้าเป็น FBS บอกได้ด้วยว่าตรวจหลังงดอาหารไหมครับ"
         )
 
     if {"ldl", "hdl", "triglycerides", "cholesterol"} & set(topics):
@@ -372,192 +160,7 @@ def _topic_specific_lab_question(state: AgentState, messages: List[BaseMessage])
 
 
 def _needs_fasting_status(lab_values: Optional[Dict[str, float]]) -> bool:
-    if not lab_values:
-        return False
-    return any(name in FASTING_RELEVANT_LABS for name in lab_values)
-
-
-def _message_content_to_text(content: Any) -> str:
-    """Normalize LLM message content into text before JSON parsing."""
-
-    if isinstance(content, str):
-        return content.strip()
-
-    if isinstance(content, list):
-        text_parts: List[str] = []
-        for item in content:
-            if isinstance(item, str):
-                text_parts.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                text_parts.append(item["text"])
-        return "\n".join(text_parts).strip()
-
-    return str(content).strip()
-
-
-def _parse_raw_json_object(text: str) -> Dict[str, Any]:
-    """
-    Parse a raw JSON object. The fallback only extracts the first object-shaped
-    span so malformed model wrappers do not crash the graph.
-    """
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise
-        parsed = json.loads(match.group(0))
-
-    if not isinstance(parsed, dict):
-        raise ValueError("Extractor response must be a JSON object.")
-
-    return parsed
-
-
-def _normalize_gender(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    normalized = str(value).strip().lower()
-    normalized = re.sub(r"^(เพศ|sex|gender)\s*[:：-]?\s*", "", normalized)
-    if normalized in {"male", "man", "m", "ชาย", "ผู้ชาย"}:
-        return "male"
-    if normalized in {"female", "woman", "f", "หญิง", "ผู้หญิง"}:
-        return "female"
-    return None
-
-
-def _normalize_yes_no(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    normalized = str(value).strip().lower()
-    if normalized in {"yes", "y", "true", "fasting", "fasted", "ใช่", "ใช่ครับ", "ใช่ค่ะ", "งด", "งดอาหาร"}:
-        return "yes"
-    if normalized in {"no", "n", "false", "not fasting", "non-fasting", "non fasting", "ไม่", "ไม่ใช่", "ไม่ใช่ครับ", "ไม่ใช่ค่ะ", "ไม่ได้งด", "ไม่ได้งดอาหาร"}:
-        return "no"
-    return None
-
-
-def _normalize_age(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
-    raw_text = str(value).strip().lower()
-    try:
-        age = int(float(raw_text))
-    except (TypeError, ValueError):
-        age_match = (
-            re.search(r"(?:อายุ|age)\s*[:：-]?\s*(\d{1,3})", raw_text)
-            or re.search(r"\b(\d{1,3})\s*(?:ปี|years?|yrs?|yo)", raw_text)
-            or re.search(r"^\s*(\d{1,3})\s*(?:ชาย|หญิง|male|female|m|f)?\s*$", raw_text)
-        )
-        if not age_match:
-            return None
-        age = int(age_match.group(1))
-    if 0 < age < 130:
-        return age
-    return None
-
-
-def _normalize_string_list(value: Any) -> Optional[List[str]]:
-    """
-    Convert extracted list-like values into a clean list.
-
-    None means "not mentioned". An empty list means the user explicitly reported
-    no known items for that slot.
-    """
-
-    if value is None:
-        return None
-    if value == []:
-        return []
-    if isinstance(value, str):
-        if not value.strip():
-            return None
-        raw_items = re.split(r",|;|\n", value)
-    elif isinstance(value, list):
-        raw_items = value
-    else:
-        return None
-
-    cleaned: List[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        text = str(item).strip()
-        if not text:
-            continue
-        key = text.casefold()
-        if key not in seen:
-            cleaned.append(text)
-            seen.add(key)
-
-    return cleaned
-
-
-def _merge_lists(
-    current: Optional[List[str]],
-    extracted: Optional[List[str]],
-) -> Optional[List[str]]:
-    if extracted is None:
-        return current
-    if extracted == []:
-        return []
-    if not current:
-        return extracted
-
-    merged = list(current)
-    seen = {item.casefold() for item in current}
-    for item in extracted:
-        key = item.casefold()
-        if key not in seen:
-            merged.append(item)
-            seen.add(key)
-    return merged
-
-
-def _normalize_lab_values(value: Any) -> Optional[Dict[str, float]]:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        return None
-
-    normalized_values: Dict[str, float] = {}
-    for raw_name, raw_value in value.items():
-        if raw_value is None or raw_value == "":
-            continue
-
-        key = str(raw_name).strip()
-        canonical_key = CRITICAL_LAB_ALIASES.get(key.casefold(), key)
-
-        try:
-            normalized_values[canonical_key] = float(raw_value)
-        except (TypeError, ValueError):
-            continue
-
-    return normalized_values
-
-
-def _merge_lab_values(
-    current: Optional[Dict[str, float]],
-    extracted: Optional[Dict[str, float]],
-) -> Optional[Dict[str, float]]:
-    if extracted is None:
-        return current
-    if not current:
-        return extracted
-    return {**current, **extracted}
-
-
-def _current_slots_for_prompt(state: AgentState) -> Dict[str, Any]:
-    return {
-        "age": state.get("age"),
-        "gender": state.get("gender"),
-        "underlying_disease": state.get("underlying_disease"),
-        "current_medications": state.get("current_medications"),
-        "current_symptoms": state.get("current_symptoms"),
-        "fasting_status": state.get("fasting_status"),
-        "extracted_lab_values": state.get("extracted_lab_values"),
-        "pending_slot": state.get("pending_slot"),
-    }
+    return needs_fasting_status(lab_values)
 
 
 def _updates_from_pending_slot(state: AgentState, latest_user_message: str) -> Dict[str, Any]:
@@ -567,87 +170,20 @@ def _updates_from_pending_slot(state: AgentState, latest_user_message: str) -> D
     if not pending_slot:
         return {}
 
-    updates: Dict[str, Any] = {}
-
-    if pending_slot == "fasting_status":
-        fasting_status = _normalize_yes_no(latest_user_message)
-        if fasting_status is not None:
-            updates["fasting_status"] = fasting_status
-            updates["pending_slot"] = None
-
-    elif pending_slot == "age":
-        age = _normalize_age(latest_user_message)
-        if age is not None:
-            updates["age"] = age
-            updates["pending_slot"] = None
-
-    elif pending_slot == "gender":
-        gender = _normalize_gender(latest_user_message)
-        if gender is not None:
-            updates["gender"] = gender
-            updates["pending_slot"] = None
-
-    elif pending_slot == "extracted_lab_values":
-        context = _conversation_user_text(state.get("messages", []))
-        lab_values = _extract_lab_values_from_text(latest_user_message, context)
-        merged_labs = _merge_lab_values(state.get("extracted_lab_values"), lab_values)
-        if merged_labs:
-            updates["extracted_lab_values"] = merged_labs
-            updates["pending_slot"] = None
-
-    return updates
-
-
-def _merge_extracted_slots(state: AgentState, extracted: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge valid extracted values with existing AgentState slots."""
-
-    updates: Dict[str, Any] = {}
-
-    age = _normalize_age(extracted.get("age"))
-    if age is not None:
-        updates["age"] = age
-
-    gender = _normalize_gender(extracted.get("gender"))
-    if gender is not None:
-        updates["gender"] = gender
-
-    fasting_status = _normalize_yes_no(extracted.get("fasting_status"))
-    if fasting_status is not None:
-        updates["fasting_status"] = fasting_status
-
-    for slot_name in (
-        "underlying_disease",
-        "current_medications",
-        "current_symptoms",
-    ):
-        extracted_list = _normalize_string_list(extracted.get(slot_name))
-        merged_list = _merge_lists(state.get(slot_name), extracted_list)
-        if merged_list is not state.get(slot_name):
-            updates[slot_name] = merged_list
-
-    lab_values = _normalize_lab_values(extracted.get("extracted_lab_values"))
-    deterministic_lab_values = _extract_lab_values_from_text(
-        extracted.get("_latest_user_message", ""),
-        extracted.get("_conversation_context", ""),
+    return parse_intake_updates(
+        state,
+        latest_user_message,
+        _conversation_user_text(state.get("messages", [])),
     )
-    lab_values = _merge_lab_values(lab_values, deterministic_lab_values)
-    merged_labs = _merge_lab_values(state.get("extracted_lab_values"), lab_values)
-    if merged_labs is not state.get("extracted_lab_values"):
-        updates["extracted_lab_values"] = merged_labs
-
-    if updates:
-        updates["pending_slot"] = None
-
-    return updates
 
 
 def extract_info_node(state: AgentState) -> Dict[str, Any]:
     """
     Extract patient slots from the latest user message and merge them into state.
 
-    The LLM is intentionally instructed to produce only a raw JSON object. If
-    parsing fails, the node returns no slot updates and allows the graph router
-    to ask the next missing question.
+    Deterministic rules run first and always win. The model pass only fills
+    catalog fields the patterns cannot reach, and is skipped entirely when the
+    message has no digits, so digit-free intake turns stay LLM-free and fast.
     """
 
     messages = state.get("messages", [])
@@ -655,110 +191,152 @@ def extract_info_node(state: AgentState) -> Dict[str, Any]:
     if not latest_user_message:
         return {}
 
-    pending_updates = _updates_from_pending_slot(state, latest_user_message)
-    state_for_prompt: AgentState = {**state, **pending_updates}
-    previous_assistant_message = _latest_assistant_text_before_latest_user(messages)
-
-    current_slots = json.dumps(
-        _current_slots_for_prompt(state_for_prompt),
-        ensure_ascii=False,
-        sort_keys=True,
+    conversation_context = _conversation_user_text(messages)
+    extracted_updates = parse_intake_updates(
+        state,
+        latest_user_message,
+        conversation_context,
     )
 
-    SYSTEM_PROMPT = f"""
-คุณคือระบบสกัดข้อมูลผู้ป่วยแบบ slot filling สำหรับแชทบอทตรวจสุขภาพ
-หน้าที่ของคุณคือสกัดข้อมูลจากข้อความล่าสุดของผู้ใช้เท่านั้น และตอบกลับเป็น JSON ดิบตาม schema ที่กำหนด
-
-ให้สกัดเฉพาะข้อเท็จจริงที่ผู้ใช้ระบุชัดเจนในข้อความล่าสุด ห้ามเดาหรือเติมข้อมูลเอง
-ใช้ข้อมูลสถานะปัจจุบันด้านล่างเพื่อเข้าใจว่าผู้ใช้กำลังแก้ไขข้อมูลเดิมหรือเพิ่มข้อมูลใหม่เท่านั้น
-
-สถานะข้อมูลที่ทราบอยู่แล้ว:
-{current_slots}
-
-คำถามล่าสุดจากผู้ช่วยก่อนข้อความนี้:
-{previous_assistant_message or "ไม่มี"}
-
-กฎการตอบ:
-- ตอบกลับเป็น JSON object ดิบที่ valid เท่านั้น
-- ห้ามใส่ markdown, code fence, คำอธิบาย, comment, หรือข้อความสนทนาอื่นๆ
-- ใช้ double quotes กับ key และ string value ทุกตัว
-- ถ้า slot ใดไม่ได้ถูกกล่าวถึงในข้อความล่าสุด ให้ใส่ null
-- ถ้าผู้ใช้ระบุชัดเจนว่าไม่มีโรคประจำตัว/ไม่มียาที่กิน/ไม่มีอาการ ให้ใส่ empty list [] ใน slot นั้น
-- ถ้าข้อความล่าสุดเป็นคำตอบสั้นๆ เช่น "ใช่", "ใช่ครับ", "ไม่ใช่", "ชาย", "หญิง" ให้ตีความตาม pending_slot หรือคำถามล่าสุดจากผู้ช่วย
-- แปลง gender ให้เป็น "male" หรือ "female" เท่านั้น
-- แปลง fasting_status ให้เป็น "yes" หรือ "no" เท่านั้น
-- ค่าผลแล็บให้ดึงเฉพาะตัวเลข ไม่ต้องใส่หน่วย ตัวอย่าง:
-  {{"FBS": 120.0, "HbA1c": 6.4, "LDL": 140.0}}
-- ถ้าผู้ใช้บอกความดัน เช่น 145/90 หรือ ตัวบน 145 ตัวล่าง 90 ให้ใส่ {{"SBP": 145.0, "DBP": 90.0}}
-
-รูปแบบ JSON ที่ต้องตอบ:
-{{
-  "age": null,
-  "gender": null,
-  "underlying_disease": null,
-  "current_medications": null,
-  "current_symptoms": null,
-  "fasting_status": null,
-  "extracted_lab_values": null
-}}
-""".strip()
-
-    try:
-        llm = _get_extraction_llm()
-        response = llm.invoke(
-            [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=latest_user_message),
-            ]
-        )
-        raw_text = _message_content_to_text(response.content)
-        extracted = _parse_raw_json_object(raw_text)
-        extracted["_latest_user_message"] = latest_user_message
-        extracted["_conversation_context"] = _conversation_user_text(messages)
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[slot_filling] JSON parsing failed: {exc}")
-        return {
-            **pending_updates,
-            "intent": _classify_interaction_intent(latest_user_message, state_for_prompt),
+    model_rejected: Dict[str, Dict[str, float]] = {}
+    model_values = extract_metrics_with_llm(
+        latest_user_message, conversation_context, rejected=model_rejected
+    )
+    if model_rejected:
+        extracted_updates["rejected_lab_values"] = {
+            **(extracted_updates.get("rejected_lab_values") or {}),
+            **model_rejected,
         }
-    except Exception as exc:
-        print(f"[slot_filling] Extraction failed: {exc}")
-        return {
-            **pending_updates,
-            "intent": _classify_interaction_intent(latest_user_message, state_for_prompt),
-        }
+    if model_values is not None:
+        # The model read the whole sentence, so it decides for this turn. Patterns
+        # cannot tell "LDL 154" from "LDL ควรต่ำกว่า 100 ไหม" and would save the
+        # threshold out of a question. An empty result means "nothing to save here",
+        # which is why it still overrides the patterns.
+        known_values = state.get("extracted_lab_values") or {}
+        merged_values = {**known_values, **model_values}
+        if merged_values != known_values:
+            extracted_updates["extracted_lab_values"] = merged_values
+            extracted_updates["pending_slot"] = None
+        else:
+            extracted_updates.pop("extracted_lab_values", None)
+            if not merged_values:
+                # Nothing was captured, so the turn must not look like the lab
+                # slot got answered; leave the pending question standing.
+                extracted_updates.pop("pending_slot", None)
 
-    extracted_updates = _merge_extracted_slots(state_for_prompt, extracted)
-    merged_state: AgentState = {**state_for_prompt, **extracted_updates}
+    intent = state.get("intent") or "unknown"
+
+    print(
+        "[slot_filling] intake: "
+        f"updates={{{', '.join(sorted(extracted_updates.keys()))}}}, "
+        f"model_fields={sorted(model_values) if model_values is not None else 'skipped'}, "
+        f"intent={intent}"
+    )
+
+    profile_update_only = bool(
+        model_values
+        and set(model_values).issubset(_PROFILE_ONLY_METRICS)
+        and "?" not in latest_user_message
+        and "ไหม" not in latest_user_message
+        and "เท่าไร" not in latest_user_message
+    )
     return {
-        **pending_updates,
         **extracted_updates,
-        "intent": _classify_interaction_intent(latest_user_message, merged_state),
+        "intent": intent,
+        # A plain profile update (e.g. "เราพึ่งไปวัดส่วนสูงมาใหม่ ได้ 170")
+        # should acknowledge the saved value, not re-interpret every older lab
+        # result in the conversation and attach their citations.
+        "profile_update_only": profile_update_only,
+        "profile_update_fields": sorted(model_values) if profile_update_only else [],
+        "health_overview_request": is_health_overview_request(latest_user_message),
     }
 
 
 def route_after_extraction(state: AgentState) -> str:
-    """Route to the first missing critical slot, in priority order."""
+    """Route after extraction without blocking answers on optional profile slots."""
 
-    if state.get("intent") in SAFETY_FIRST_INTENTS:
-        return "our_agent"
+    latest_user_message = _latest_user_text(state.get("messages", []))
+    labs = state.get("extracted_lab_values") or {}
 
-    lab_values = state.get("extracted_lab_values")
-    if not lab_values:
+    if state.get("intent") in DIRECT_RESPONSE_INTENTS:
         return "ask_lab_node"
 
-    # Once a lab value is available, answer the user's primary question first.
-    # The analyst prompt can ask for age, gender, or fasting status afterward if
-    # it would materially improve personalization.
+    if state.get("profile_update_only"):
+        return "acknowledge_profile_update"
+
+    # When the preceding turn asked for a laboratory value, a reply containing
+    # only profile information (for example, "I am 26") must stay on the
+    # deterministic intake path.  Previously it could fall through to the
+    # analyst, trigger RAG, and append irrelevant textbook citations.
+    if state.get("pending_slot") == "extracted_lab_values" and not labs:
+        return "ask_lab_node"
+
+    next_slot = next_required_slot(state)
+    if next_slot == "extracted_lab_values":
+        if state.get("intent") not in {"lab_interpretation", "general_info"}:
+            return "our_agent"
+        return "ask_lab_node"
+
+    # Once lab/profile data is available, answer the primary question first.
+    # Age, gender, and fasting status are collected by the analyst follow-up.
     return "our_agent"
+
+
+def acknowledge_profile_update_node(state: AgentState) -> Dict[str, Any]:
+    """Confirm a profile-only change without invoking retrieval or the LLM."""
+    labels = [
+        _PROFILE_METRIC_LABELS[key]
+        for key in state.get("profile_update_fields") or []
+        if key in _PROFILE_METRIC_LABELS
+    ]
+    detail = " และ ".join(labels) if labels else "ข้อมูลสุขภาพ"
+    return {
+        "messages": [AIMessage(content=f"รับทราบครับ อัปเดต{detail}ให้แล้วครับ")],
+        "citations": [],
+        "profile_update_only": False,
+        "profile_update_fields": [],
+    }
 
 
 def ask_lab_node(state: AgentState) -> Dict[str, Any]:
     messages = state.get("messages", [])
     latest_user_message = _latest_user_text(messages)
     topic_specific_question = _topic_specific_lab_question(state, messages)
+    labs = state.get("extracted_lab_values") or {}
+    intent = state.get("intent")
 
-    if topic_specific_question:
+    if intent == "greeting":
+        if labs:
+            content = (
+                "สวัสดีครับ ผมยังใช้ข้อมูลผลตรวจที่คุยกันไว้เป็นบริบทได้ครับ "
+                "ถ้าอยากให้ช่วยดูค่าล่าสุดหรือถามต่อจากผลตรวจเดิม ส่งคำถามมาได้เลยครับ"
+            )
+        else:
+            content = (
+                "สวัสดีครับ ผมช่วยดูผลตรวจสุขภาพเบื้องต้นได้ครับ\n\n"
+                f"{_intake_question_text()}"
+            )
+    elif intent == "capability_question":
+        content = (
+            "ผมช่วยให้ข้อมูลเบื้องต้นและช่วยแปลผลตรวจในกลุ่มหลัก ๆ เหล่านี้ครับ:\n"
+            "- เบาหวาน\n"
+            "- ความดันโลหิตสูง\n"
+            "- ไขมันในเลือดสูง\n"
+            "- โรคไตเรื้อรัง (CKD)\n"
+            "- ภาวะที่เกี่ยวข้องกับการทำงานของตับ\n\n"
+            f"{_intake_question_text()}"
+        )
+    elif intent == "out_of_scope":
+        content = (
+            "ขออภัยครับ ผมช่วยได้เฉพาะเรื่องสุขภาพและการแปลผลตรวจสุขภาพเท่านั้น\n"
+            "หากมีคำถามเกี่ยวกับอาการ ผลแลป หรือโรคที่เกี่ยวข้อง ยินดีช่วยเสมอครับ"
+        )
+    elif intent == "unknown":
+        content = (
+            "ผมยังไม่แน่ใจว่าต้องการให้ช่วยเรื่องใดครับ "
+            "ลองส่งคำถามเกี่ยวกับอาการหรือค่าผลตรวจที่ต้องการให้ช่วยดูได้เลยครับ"
+        )
+    elif topic_specific_question:
         content = topic_specific_question
     elif _looks_like_scope_question(latest_user_message):
         content = (
@@ -771,24 +349,35 @@ def ask_lab_node(state: AgentState) -> Dict[str, Any]:
             f"{_intake_question_text()}"
         )
     elif _looks_like_greeting(latest_user_message):
-        content = (
-            "สวัสดีครับ ผมช่วยดูผลตรวจสุขภาพเบื้องต้นได้ครับ\n\n"
-            f"{_intake_question_text()}"
-        )
+        if labs:
+            content = (
+                "สวัสดีครับ ผมยังใช้ข้อมูลผลตรวจที่คุยกันไว้เป็นบริบทได้ครับ "
+                "ถ้าอยากให้ช่วยดูค่าล่าสุดหรือถามต่อจากผลตรวจเดิม ส่งคำถามมาได้เลยครับ"
+            )
+        else:
+            content = (
+                "สวัสดีครับ ผมช่วยดูผลตรวจสุขภาพเบื้องต้นได้ครับ\n\n"
+                f"{_intake_question_text()}"
+            )
     else:
         content = _intake_question_text()
 
-    return {
-        "pending_slot": "extracted_lab_values",
+    result: Dict[str, Any] = {
         "messages": [
             AIMessage(content=content)
-        ]
+        ],
+        # Explicitly clear any transient retrieval data on an intake-only turn.
+        "citations": [],
     }
+    if not labs:
+        result["pending_slot"] = "extracted_lab_values"
+    return result
 
 
 def ask_fasting_node(state: AgentState) -> Dict[str, Any]:
     return {
         "pending_slot": "fasting_status",
+        "citations": [],
         "messages": [
             AIMessage(
                 content=(
@@ -807,6 +396,7 @@ def ask_age_node(state: AgentState) -> Dict[str, Any]:
 
     return {
         "pending_slot": "age",
+        "citations": [],
         "messages": [
             AIMessage(content=question)
         ]
@@ -816,6 +406,7 @@ def ask_age_node(state: AgentState) -> Dict[str, Any]:
 def ask_gender_node(state: AgentState) -> Dict[str, Any]:
     return {
         "pending_slot": "gender",
+        "citations": [],
         "messages": [
             AIMessage(
                 content=(
@@ -853,6 +444,7 @@ def build_slot_filling_graph():
 
     graph = StateGraph(AgentState)
 
+    graph.add_node("classify_turn_intent", classify_turn_intent_node)
     graph.add_node("extract_info_node", extract_info_node)
     graph.add_node("ask_lab_node", ask_lab_node)
     graph.add_node("ask_fasting_node", ask_fasting_node)
@@ -860,7 +452,8 @@ def build_slot_filling_graph():
     graph.add_node("ask_gender_node", ask_gender_node)
     graph.add_node("our_agent", our_agent)
 
-    graph.set_entry_point("extract_info_node")
+    graph.set_entry_point("classify_turn_intent")
+    graph.add_edge("classify_turn_intent", "extract_info_node")
 
     graph.add_conditional_edges(
         "extract_info_node",
