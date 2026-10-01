@@ -102,7 +102,7 @@ def _analysis_slot_context(state: AgentState) -> str:
         f"\n- current_medications: {state.get('current_medications')}"
         f"\n- current_symptoms: {state.get('current_symptoms')}"
         f"\n- extracted_lab_values: {lab_text}"
-        f"\n- rejected_lab_values (NOT saved, out of plausible range): {rejected_text}"
+        f"\n- rejected_lab_values (NOT saved, outside the allowed range): {rejected_text}"
         f"\n- profile_metrics: {_compact_json(profile_metrics) if profile_metrics else '-'}"
         f"\n- health_state: {_compact_json(health_state) if health_state else '-'}"
     )

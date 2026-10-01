@@ -21,31 +21,32 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from .llm_timing import timed_llm_invoke
 
 
-# id -> (Thai label, unit, plausible min, plausible max)
+# id -> (Thai label, unit, min, max). Bounds agreed with the clinician:
+# 0-10000 for every field, 0-100 for percentages. Values keep two decimals.
 METRIC_CATALOG: Dict[str, tuple[str, str, float, float]] = {
-    "SBP": ("ความดันตัวบน (SBP)", "มม.ปรอท", 50, 260),
-    "DBP": ("ความดันตัวล่าง (DBP)", "มม.ปรอท", 30, 180),
-    "HeartRate": ("ชีพจร (Heart Rate)", "ครั้ง/นาที", 25, 220),
-    "Weight": ("น้ำหนัก (Weight)", "กก.", 10, 400),
-    "Height": ("ส่วนสูง (Height)", "ซม.", 50, 250),
-    "BMI": ("ดัชนีมวลกาย (BMI)", "กก./ม.²", 8, 100),
-    "WaistCircumference": ("รอบเอว (Waist)", "ซม.", 30, 250),
-    "FBS": ("น้ำตาลในเลือด (FBS)", "มก./ดล.", 20, 900),
-    "HbA1c": ("น้ำตาลสะสม (HbA1c)", "%", 3, 20),
-    "Total Cholesterol": ("คอเลสเตอรอลรวม (Total Cholesterol)", "มก./ดล.", 50, 600),
-    "LDL": ("แอล ดี แอล คอเลสเตอรอล (LDL-C)", "มก./ดล.", 10, 500),
-    "HDL": ("เอช ดี แอล คอเลสเตอรอล (HDL-C)", "มก./ดล.", 5, 150),
-    "Triglycerides": ("ไตรกลีเซอไรด์ (Triglycerides)", "มก./ดล.", 20, 2000),
-    "Hemoglobin": ("ฮีโมโกลบิน (Hemoglobin)", "ก./ดล.", 3, 25),
-    "eGFR": ("อัตราการกรองของไต (eGFR)", "มล./นาที/1.73 ม.²", 1, 200),
-    "Creatinine": ("ครีแอตินีน (Creatinine)", "มก./ดล.", 0.1, 25),
-    "BUN": ("ยูเรียไนโตรเจนในเลือด (BUN)", "มก./ดล.", 1, 200),
+    "SBP": ("ความดันตัวบน (SBP)", "มม.ปรอท", 0, 10000),
+    "DBP": ("ความดันตัวล่าง (DBP)", "มม.ปรอท", 0, 10000),
+    "HeartRate": ("ชีพจร (Heart Rate)", "ครั้ง/นาที", 0, 10000),
+    "Weight": ("น้ำหนัก (Weight)", "กก.", 0, 10000),
+    "Height": ("ส่วนสูง (Height)", "ซม.", 0, 10000),
+    "BMI": ("ดัชนีมวลกาย (BMI)", "กก./ม.²", 0, 10000),
+    "WaistCircumference": ("รอบเอว (Waist)", "ซม.", 0, 10000),
+    "FBS": ("น้ำตาลในเลือด (FBS)", "มก./ดล.", 0, 10000),
+    "HbA1c": ("น้ำตาลสะสม (HbA1c)", "%", 0, 100),
+    "Total Cholesterol": ("คอเลสเตอรอลรวม (Total Cholesterol)", "มก./ดล.", 0, 10000),
+    "LDL": ("แอล ดี แอล คอเลสเตอรอล (LDL-C)", "มก./ดล.", 0, 10000),
+    "HDL": ("เอช ดี แอล คอเลสเตอรอล (HDL-C)", "มก./ดล.", 0, 10000),
+    "Triglycerides": ("ไตรกลีเซอไรด์ (Triglycerides)", "มก./ดล.", 0, 10000),
+    "Hemoglobin": ("ฮีโมโกลบิน (Hemoglobin)", "ก./ดล.", 0, 10000),
+    "eGFR": ("อัตราการกรองของไต (eGFR)", "มล./นาที/1.73 ม.²", 0, 10000),
+    "Creatinine": ("ครีแอตินีน (Creatinine)", "มก./ดล.", 0, 10000),
+    "BUN": ("ยูเรียไนโตรเจนในเลือด (BUN)", "มก./ดล.", 0, 10000),
     "UACR": ("อัลบูมินต่อครีแอตินีน (UACR)", "มก./ก.", 0, 10000),
-    "Potassium": ("โพแทสเซียม (Potassium)", "มิลลิโมล/ล.", 1, 10),
-    "Calcium": ("แคลเซียม (Calcium)", "มก./ดล.", 3, 20),
-    "Phosphate": ("ฟอสเฟต (Phosphate)", "มก./ดล.", 0.5, 15),
-    "AST": ("เอนไซม์ตับ (AST)", "ยูนิต/ล.", 1, 5000),
-    "ALT": ("เอนไซม์ตับ (ALT)", "ยูนิต/ล.", 1, 5000),
+    "Potassium": ("โพแทสเซียม (Potassium)", "มิลลิโมล/ล.", 0, 10000),
+    "Calcium": ("แคลเซียม (Calcium)", "มก./ดล.", 0, 10000),
+    "Phosphate": ("ฟอสเฟต (Phosphate)", "มก./ดล.", 0, 10000),
+    "AST": ("เอนไซม์ตับ (AST)", "ยูนิต/ล.", 0, 10000),
+    "ALT": ("เอนไซม์ตับ (ALT)", "ยูนิต/ล.", 0, 10000),
 }
 
 _FIELD_LIST = "\n".join(
@@ -83,7 +84,7 @@ def _coerce_catalog_value(
     raw_value: Any,
     rejected: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Optional[float]:
-    """Accept only known ids carrying a physiologically plausible number."""
+    """Accept only known ids carrying a number inside the field's bounds."""
 
     key = str(metric_id).strip()
     definition = METRIC_CATALOG.get(key)
@@ -91,7 +92,7 @@ def _coerce_catalog_value(
         return None
 
     try:
-        value = float(raw_value)
+        value = round(float(raw_value), 2)
     except (TypeError, ValueError):
         return None
 
@@ -144,7 +145,7 @@ def extract_metrics_with_llm(
     instead of mistaking a failure for "nothing found".
 
     When `rejected` is passed, any catalog field the model named with an
-    implausible value is recorded there (id -> {value, min, max}) instead of
+    out-of-range value is recorded there (id -> {value, min, max}) instead of
     being silently dropped, so the caller can tell the user it was not saved.
     """
 

@@ -29,7 +29,7 @@ def lab_prompt(context: str, summary_context: str, latest_user_message: str = ""
         "- Do not write citations, references, source names, or page numbers. The application adds exactly one verified citation section after your answer.\n"
         "- Never say a value was recorded/saved/บันทึก unless it appears in extracted_lab_values above. "
         "If the user asked you to save a value and it instead appears in rejected_lab_values, "
-        "clearly tell them it was NOT saved because it is outside the plausible range, and state that range.\n"
+        "clearly tell them it was NOT saved because it is outside the allowed range, and state that range.\n"
     )
 
 

@@ -107,7 +107,7 @@ def extract_lab_values(
     Deterministic, regex-based lab extraction.
 
     A matched number that a catalog field recognizes but falls outside its
-    plausible range is never saved into the returned dict. When `rejected` is
+    allowed range is never saved into the returned dict. When `rejected` is
     passed, it is recorded there (id -> {value, min, max}) instead of being
     silently dropped, so the caller can tell the user it was not saved.
     """
@@ -116,6 +116,7 @@ def extract_lab_values(
     values: Dict[str, float] = {}
 
     def _record(canonical_name: str, value: float) -> None:
+        value = round(value, 2)
         definition = METRIC_CATALOG.get(canonical_name)
         if not definition:
             values[canonical_name] = value

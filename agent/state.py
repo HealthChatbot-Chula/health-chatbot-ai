@@ -28,7 +28,7 @@ class AgentState(TypedDict, total=False):
     fasting_status: Optional[str]  # "yes" or "no"
     extracted_lab_values: Optional[Dict[str, float]]
     # Values the user reported this turn that a catalog field recognized but
-    # rejected as outside its plausible range (id -> {value, min, max}). Reset
+    # rejected as outside its allowed range (id -> {value, min, max}). Reset
     # every turn so the analyst never re-warns about an old, already-handled
     # rejection. It exists so the reply can honestly say a value was NOT saved
     # instead of defaulting to a polite "รับทราบ...บันทึกแล้วครับ".
