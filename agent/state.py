@@ -6,6 +6,16 @@ from langgraph.graph.message import add_messages
 
 class AgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
+    # Per-request signed web capability. Never saved in health memory or prompts.
+    appointment_context: Optional[Dict[str, str]]
+    appointment_tool_calls: int
+    # Validated create/reschedule/cancel operations waiting for the user's confirmation.
+    # Server-side only; valid for the immediately following turn.
+    appointment_pending: Optional[List[Dict[str, object]]]
+    # Quick-reply buttons for this reply (label/value pairs).
+    appointment_choices: Optional[List[Dict[str, str]]]
+    # True when the previous turn was handled by the appointment agent.
+    appointment_active: Optional[bool]
 
     # Runtime/debug metadata used by the existing graph.
     summary: str

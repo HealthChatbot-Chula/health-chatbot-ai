@@ -21,6 +21,9 @@ from .slot_filling_graph import (
 )
 from .state import AgentState
 from .tools import tools
+from .appointment_routing import route_after_turn_intent
+from .appointment_tools import appointment_tools
+from .appointments import appointment_agent_node, route_appointment_tools
 
 
 def should_continue(state: AgentState):
@@ -40,6 +43,8 @@ def build_graph():
     graph.add_node("input", input_node)
     graph.add_node("guardrail_input", guardrail_input_node)
     graph.add_node("classify_turn_intent", classify_turn_intent_node)
+    graph.add_node("appointment_agent", appointment_agent_node)
+    graph.add_node("appointment_tools", ToolNode(appointment_tools))
     graph.add_node("extract_info_node", extract_info_node)
     graph.add_node("ask_lab_node", ask_lab_node)
     graph.add_node("acknowledge_profile_update", acknowledge_profile_update_node)
@@ -65,7 +70,14 @@ def build_graph():
             "continue": "classify_turn_intent",
         },
     )
-    graph.add_edge("classify_turn_intent", "extract_info_node")
+    graph.add_conditional_edges("classify_turn_intent", route_after_turn_intent, {
+        "appointment_agent": "appointment_agent",
+        "extract_info_node": "extract_info_node",
+    })
+    graph.add_conditional_edges("appointment_agent", route_appointment_tools, {
+        "appointment_tools": "appointment_tools", "__end__": END,
+    })
+    graph.add_edge("appointment_tools", "appointment_agent")
 
     graph.add_conditional_edges(
         "extract_info_node",

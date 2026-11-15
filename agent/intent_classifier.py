@@ -16,9 +16,12 @@ from .intake import (
 )
 from .llm_timing import timed_llm_invoke
 from .state import AgentState
+from .appointment_replies import confirmation_decision, pending_action
+from .appointment_routing import is_appointment_request
 
 
 TURN_INTENTS = {
+    "appointment",
     "greeting",
     "capability_question",
     "out_of_scope",
@@ -41,6 +44,7 @@ _SYSTEM_PROMPT = """You classify the latest message sent to a Thai health chatbo
 Return only JSON in this exact shape: {"intent": "one_allowed_value"}.
 
 Allowed values:
+- appointment: asks to book, check, reschedule or cancel an appointment; includes short follow-ups selecting a date/time or confirming an appointment discussed in recent context
 - greeting: greetings, thanks, acknowledgements, or casual pleasantries
 - capability_question: asks what the chatbot can do or which conditions it supports
 - out_of_scope: clearly asks about a non-health topic
@@ -63,6 +67,8 @@ Examples:
 - "แล้วค่าที่ส่งไปต่ำไหม" after a lab discussion -> lab_interpretation
 - "ควรหยุดยาไหม" -> medication_safety
 - "เขียนโค้ด Python ให้หน่อย" -> out_of_scope
+- "ขอจองนัดอธิบายผลตรวจ" -> appointment
+- "9 โมงค่ะ" after being offered appointment slots -> appointment
 """
 
 
@@ -103,6 +109,8 @@ def _parse_intent_response(content: Any) -> str:
 def _fallback_intent(text: str) -> str:
     """Use current-turn rules only; never infer intent from saved lab values."""
 
+    if is_appointment_request(text):
+        return "appointment"
     intent = classify_interaction_intent(text, {})
     if intent in {"medication_safety", "urgent_red_flag", "general_info"}:
         return "greeting" if intent == "general_info" else intent
@@ -113,6 +121,22 @@ def classify_turn_intent_node(state: AgentState) -> dict[str, str]:
     latest_message = latest_user_text(state.get("messages", []))
     if not latest_message:
         return {"intent": "unknown"}
+
+    # Do not mistake a new appointment request for an answer to medical intake.
+    # Current-turn clinical emergencies/medication requests still take priority.
+    safety = classify_interaction_intent(latest_message, {})
+    critical_labs = extract_lab_values(latest_message, "") or {}
+    critical_glucose = critical_labs.get("FBS")
+    if "Potassium" in critical_labs or (critical_glucose is not None and critical_glucose >= 300):
+        return {"intent": "urgent_red_flag"}
+    if safety not in {"medication_safety", "urgent_red_flag"} and is_appointment_request(latest_message):
+        return {"intent": "appointment"}
+    # A bare "ใช่"/"ไม่" right after the bot asked to confirm a booking.
+    pending = state.get("appointment_pending")
+    if pending and safety not in {"medication_safety", "urgent_red_flag"} and confirmation_decision(
+        latest_message, pending_action(pending)
+    ):
+        return {"intent": "appointment"}
 
     pending_slot = state.get("pending_slot")
     if pending_slot:
@@ -131,14 +155,6 @@ def classify_turn_intent_node(state: AgentState) -> dict[str, str]:
     if safety_intent in {"medication_safety", "urgent_red_flag"}:
         print(f"[turn_intent] intent={safety_intent} safety_override=true")
         return {"intent": safety_intent}
-
-    current_labs = extract_lab_values(latest_message, "") or {}
-    glucose_value = current_labs.get("FBS")
-    if "Potassium" in current_labs or (
-        glucose_value is not None and glucose_value >= 300
-    ):
-        print("[turn_intent] intent=urgent_red_flag current_lab_override=true")
-        return {"intent": "urgent_red_flag"}
 
     prompt_parts = []
     recent_context = _recent_context(state)
@@ -163,6 +179,14 @@ def classify_turn_intent_node(state: AgentState) -> dict[str, str]:
     except Exception as exc:
         intent = _fallback_intent(latest_message)
         print(f"[turn_intent] classification failed; fallback={intent}. error={exc}")
+
+    # Tie-breaker only: a message the classifier cannot place ("ไม่รู้",
+    # "แล้วแต่") continues the appointment conversation it follows. Anything
+    # recognised as a health topic above has already left this function or
+    # carries its own intent, so it still reaches the medical route.
+    if intent == "unknown" and state.get("appointment_active"):
+        print("[turn_intent] intent=appointment continued_from_previous_turn=true")
+        return {"intent": "appointment"}
 
     print(f"[turn_intent] intent={intent}")
     return {"intent": intent}

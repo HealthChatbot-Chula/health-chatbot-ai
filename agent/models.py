@@ -46,3 +46,11 @@ chat_model = ChatVertexAI(
     # ceiling for cases containing several lab domains.
     max_output_tokens=512,
 )
+
+# Tool-call arguments plus the final appointment reply need more headroom than
+# a short clinical answer. Keep the clinical model's existing limit unchanged.
+appointment_model = ChatVertexAI(
+    model=os.getenv("APPOINTMENT_CHAT_MODEL", os.getenv("HEALTH_CHAT_MODEL", "gemini-2.5-flash-lite")),
+    temperature=0,
+    max_output_tokens=2048,
+)

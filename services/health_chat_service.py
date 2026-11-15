@@ -140,6 +140,9 @@ def _summarize_messages(
         "Summarize the preceding conversation into compact context for a health chatbot.\n"
         "Keep only important facts: age, sex, laboratory results, conditions, medications, symptoms, "
         "the user's questions or concerns, and important prior answers.\n"
+        "For appointments, preserve the active user-requested action, original appointment date/time, "
+        "target date/time, corrections and unresolved fields. Distinguish user requests from completed "
+        "operations; assistant claims alone do not establish success. Latest user corrections replace older values.\n"
         "Do not give new advice, diagnose, or invent facts absent from the transcript.\n"
         "Write the summary in Thai in no more than eight short bullet points.\n\n"
     )
@@ -619,6 +622,9 @@ def pending_slot_fast_response(
     conversation_key_value: str,
     latest_user_message: str,
 ) -> Optional[tuple[str, Optional[dict[str, Any]]]]:
+    from agent.appointment_routing import is_appointment_request
+    if is_appointment_request(latest_user_message):
+        return None
     slot_state = initial_slot_state(conversation_key_value)
     pending_slot = slot_state.get("pending_slot")
 
@@ -834,6 +840,11 @@ def _run_chat_completion_with_timing(
     with timed_section("graph_invoke"):
         result = graph.invoke({
             "messages": windowed_messages,
+            "appointment_context": req.appointment_context,
+            "appointment_tool_calls": 0,
+            "appointment_pending": slot_memory_store.get(conversation_key_value, {}).get("appointment_pending"),
+            "appointment_active": bool(slot_memory_store.get(conversation_key_value, {}).get("appointment_active")),
+            "appointment_choices": None,
             "steps": [],
             "current_node": "",
             "intent": None,
@@ -841,6 +852,13 @@ def _run_chat_completion_with_timing(
             "summary": summary,
         })
     save_slot_state(conversation_key_value, result)
+    # A proposed booking can only be confirmed by the very next message. Any
+    # other kind of turn discards it, so a later "ใช่" cannot trigger it.
+    was_appointment = result.get("intent") == "appointment"
+    appointment_memory = slot_memory_store.setdefault(conversation_key_value, {})
+    appointment_memory["appointment_pending"] = result.get("appointment_pending") if was_appointment else None
+    # Lets an unclear follow-up ("ไม่รู้") stay with the appointment agent.
+    appointment_memory["appointment_active"] = was_appointment
 
     assistant_msg = result["messages"][-1]
     assistant_content = assistant_msg.content
@@ -856,6 +874,10 @@ def _run_chat_completion_with_timing(
     if citations:
         metadata["citations"] = citations
     health_state = health_state_snapshot(conversation_key_value)
+    if result.get("intent") == "appointment":
+        health_state["pending_slot"] = None
+        if result.get("appointment_choices"):
+            metadata["choices"] = result["appointment_choices"]
     if health_state:
         metadata["health_state"] = health_state
     return assistant_content, usage_data, metadata or None

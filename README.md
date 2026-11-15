@@ -6,6 +6,9 @@ An OpenAI-compatible Thai health-information chatbot for preliminary checkup-res
 
 ## Features
 
+- Google Calendar appointment tools through the authenticated web backend;
+  see [appointment setup](docs/google-calendar-appointments.md).
+
 - Thai responses from English LLM instructions.
 - Deterministic extraction of common laboratory values, age, sex, and fasting status.
 - Citation-aware retrieval from Thai clinical textbooks, with **book page** references.
