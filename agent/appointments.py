@@ -8,12 +8,12 @@ next message confirms it - so a bare "ใช่" never has to be re-interpreted.
 
 import json
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from . import appointment_tools as api
 from .appointment_prompts import appointment_prompt
 from .appointment_replies import (
-    CONFIRM_CHOICES, confirmation_decision, confirmation_text, error_reply,
+    CONFIRM_CHOICES, confirmation_decision, confirmation_text, error_reply, free_slot_choices,
     pending_action, read_reply, reply_text, strip_foreign, suggestion_choices,
     tool_data, write_failure, write_reply,
 )
@@ -35,14 +35,23 @@ def _turn_tools(messages):
     return list(reversed(result))
 
 
-def _dialogue(messages, limit: int = 6) -> str:
-    latest = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].type == "human"), 0)
-    lines = []
+def _history(messages, latest: int, limit: int = 6):
+    """Earlier turns as real chat messages, so a follow-up like "9.30" is read
+    together with the day the bot just offered. Text only: tool calls of past
+    turns are not replayed. Gemini expects user/model turns to alternate and to
+    start with the user, so consecutive same-role messages are merged."""
+    history = []
     for message in messages[:latest][-limit:]:
-        if message.type in {"human", "ai"} and reply_text(message.content).strip():
-            speaker = "User" if message.type == "human" else "Assistant"
-            lines.append(f"{speaker}: {reply_text(message.content).strip()[:400]}")
-    return "\n".join(lines)
+        text = reply_text(message.content).strip()
+        if message.type not in {"human", "ai"} or not text:
+            continue
+        if history and history[-1].type == message.type:
+            history[-1] = type(history[-1])(content=f"{history[-1].content}\n{text}")
+        elif history or message.type == "human":
+            history.append(HumanMessage(content=text) if message.type == "human" else AIMessage(content=text))
+    if history and history[-1].type == "human":
+        history.append(AIMessage(content="รับทราบครับ"))
+    return history
 
 
 def appointment_agent_node(state):
@@ -95,7 +104,15 @@ def appointment_agent_node(state):
             return finish(text, proposed, CONFIRM_CHOICES)
         return finish("\n".join(refused), choices=suggestion_choices(results[0]) if len(results) == 1 else None)
 
-    # 3) Let the model choose the next tool, or answer / ask for what is missing.
+    # 3) Some look-ups have a fixed answer, so the model cannot misreport them
+    #    (it described an empty appointment list as "the system is not ready").
+    #    Free-slot results still go back to the model, which may book next.
+    if done:
+        last = tool_data(done[-1])
+        if last.get("error") or getattr(done[-1], "name", "") == "get_my_appointments":
+            return finish(read_reply(last))
+
+    # 4) Let the model choose the next tool, or answer / ask for what is missing.
     rounds = state.get("appointment_tool_calls", 0)
     fallback = (read_reply(tool_data(done[-1])) if done else "") or _ASK_AGAIN
     if rounds >= MAX_MODEL_ROUNDS:
@@ -104,7 +121,7 @@ def appointment_agent_node(state):
 
     response = timed_llm_invoke(
         appointment_model.bind_tools(api.appointment_tools),
-        [SystemMessage(content=appointment_prompt(_dialogue(messages))),
+        [SystemMessage(content=appointment_prompt()), *_history(messages, latest),
          *[m for m in messages[latest:] if m.type != "system"]],
         "appointment_response",
     )
@@ -118,7 +135,10 @@ def appointment_agent_node(state):
         response = response.model_copy(update={"content": "", "tool_calls": keep})
         return {"messages": [response], "appointment_pending": None, "appointment_choices": None, "pending_slot": None,
                 "citations": [], "appointment_tool_calls": rounds + 1}
-    return finish(strip_foreign(reply_text(response.content)).strip() or fallback)
+    # Free times just shown become buttons, so picking one needs no guessing.
+    slots = [tool_data(m) for m in done if getattr(m, "name", "") == "get_available_slots"]
+    choices = free_slot_choices(slots[-1]) if len(slots) == 1 else None
+    return finish(strip_foreign(reply_text(response.content)).strip() or fallback, choices=choices)
 
 
 def route_appointment_tools(state):

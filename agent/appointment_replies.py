@@ -171,6 +171,16 @@ def suggestion_choices(result: dict):
             for time in _nearest(suggestion.get("times"), requested.get("time") or "", 4)] or None
 
 
+def free_slot_choices(result: dict):
+    """One button per free time of a checked day; each sends a complete booking request."""
+    times = [value for value in result.get("free_times") or [] if isinstance(value, str)]
+    try:
+        lead = f"ขอจองนัดวันที่ {_short_date(result['date'])} เวลา "
+    except (KeyError, ValueError, TypeError):
+        return None
+    return [{"label": time, "value": lead + time} for time in times] or None
+
+
 def error_reply(result: dict, wrote: bool = False) -> str:
     """Explain a refused/failed operation using only what the backend said.
 
@@ -218,9 +228,16 @@ def write_reply(operation: dict, result: dict) -> str:
 
 
 def read_reply(result: dict) -> str:
-    """Fallback wording when the model returns no text after a read tool."""
+    """Fixed wording for a look-up result (also the fallback for empty model text)."""
     if result.get("error"):
-        return error_reply(result)
+        message = result.get("error") if isinstance(result.get("error"), str) else ""
+        reply = error_reply(result)
+        # A look-up changes nothing, so the backend's own reason is safe to show
+        # and tells whoever runs the system what to fix.
+        if message and result.get("code") not in {"unknown_outcome", "ambiguous", "not_found"} \
+                and message not in reply and result.get("status") != 401:
+            reply = f"ขณะนี้ใช้งานระบบนัดหมายไม่ได้ครับ ({message})"
+        return reply
     if isinstance(result.get("appointments"), list):
         if not result["appointments"]:
             return "ขณะนี้คุณไม่มีนัดหมายที่กำลังจะถึงครับ"

@@ -110,6 +110,7 @@ class AppointmentReplyTests(unittest.TestCase):
         self.assertIn("2026-11-15 วันอาทิตย์ (วันนี้) - closed", prompt)
         self.assertIn("2026-11-20 วันศุกร์", prompt)
         self.assertLess(len(prompt.splitlines()), 32)
+        self.assertIn("date just discussed", prompt)
 
 
 if __name__ == "__main__":

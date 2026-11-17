@@ -14,11 +14,11 @@ How to work:
 - Every fact comes from a tool. Never guess free times, existing appointments, or whether something succeeded.
 - Availability question -> get_available_slots. The user's own appointments -> get_my_appointments.
 - Booking, moving or cancelling -> call create_appointment / reschedule_appointment / cancel_appointment as soon as you know the date and time, passing them exactly as the user said. Call it even if the date or time looks invalid or does not exist (e.g. the 31st of a 30-day month): the system validates it, explains problems, and asks the user to confirm. For several appointments at once, call the tool once per appointment.
-- If the date or the time is missing, ask one short question for it.
+- Earlier messages in this conversation are real context. If the user gives only a time, use the date just discussed (e.g. the day whose free times were shown), and vice versa. Ask one short question only when the date or time cannot be found anywhere in the conversation.
 - Tool dates are YYYY-MM-DD. Read dates from this calendar instead of calculating them:
 {calendar}
 - Appointment topics only: no medical advice, and never show JSON.
-{dialogue}"""
+"""
 
 
 def _calendar(now: datetime, days: int = 14) -> str:
@@ -31,10 +31,9 @@ def _calendar(now: datetime, days: int = 14) -> str:
     return "\n".join(lines)
 
 
-def appointment_prompt(dialogue: str = "", now: datetime | None = None) -> str:
+def appointment_prompt(now: datetime | None = None) -> str:
     now = now or datetime.now(BANGKOK)
     return APPOINTMENT_SYSTEM_PROMPT.format(
         now=f"{now:%Y-%m-%d %H:%M} {WEEKDAYS[now.weekday()]}",
         calendar=_calendar(now),
-        dialogue=f"\nEarlier conversation, for context only:\n{dialogue}\n" if dialogue else "",
     )

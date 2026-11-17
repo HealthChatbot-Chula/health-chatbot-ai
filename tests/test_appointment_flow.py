@@ -38,6 +38,8 @@ class FakeBackend:
             if minute not in {"00", "30"}:
                 return {"error": "นัดหมายเป็นช่วงละ 30 นาที เริ่มได้เฉพาะนาทีที่ :00 หรือ :30", "status": 400, "code": "off_grid",
                         "suggestion": {"date": args["date"], "times": ["14:00", "14:30"]}}
+        if action == "available":
+            return {"slots": [{"start": f"{args['date']}T0{h}:{m}:00Z"} for h in (1, 2) for m in ("00", "30")]}
         if action == "check":
             return {"ok": True}
         if action == "reschedule":
@@ -69,6 +71,7 @@ class AppointmentFlowTests(unittest.TestCase):
         self.pending = None
         self.choices = None
         self.model_calls = 0
+        self.model_inputs = []
 
     def say(self, text, *model_replies):
         """One chat turn. Like the real service, only user/assistant text and
@@ -81,6 +84,7 @@ class AppointmentFlowTests(unittest.TestCase):
 
         def invoke(model, messages, label):
             self.model_calls += 1
+            self.model_inputs.append(messages)
             return script.pop(0)
 
         self.history.append(HumanMessage(content=text))
@@ -122,6 +126,37 @@ class AppointmentFlowTests(unittest.TestCase):
         self.say("ใช่", AIMessage(content="ต้องการให้ช่วยเรื่องนัดหมายอะไรครับ"))
         self.assertEqual(len(self.backend.writes()), 1)
 
+    def test_empty_or_failed_appointment_list_is_reported_exactly(self):
+        self.backend.appointments = {}
+        # The model only picks the tool; it is not asked to describe the result.
+        reply = self.say("ดูนัดหมาย", call("get_my_appointments"))
+        self.assertEqual(reply, "ขณะนี้คุณไม่มีนัดหมายที่กำลังจะถึงครับ")
+
+        self.backend.appointments = {"evt20": "2026-11-20T08:00:00Z"}
+        reply = self.say("ดูนัดหมายทั้งหมด", call("get_my_appointments"))
+        self.assertIn("วันศุกร์ที่ 20 พฤศจิกายน 2026 เวลา 15:00", reply)
+
+        failing = lambda state, action, **args: {"error": "ยังไม่ได้ตั้งค่าการเชื่อมต่อ Google Calendar", "status": 503}
+        with patch.object(self, "backend", failing):
+            reply = self.say("ดูนัดหมาย", call("get_my_appointments"))
+        self.assertIn("ยังไม่ได้ตั้งค่าการเชื่อมต่อ Google Calendar", reply)
+        self.assertNotIn("เรียบร้อย", reply)
+
+    def test_time_only_follow_up_sees_the_day_just_offered(self):
+        reply = self.say("พรุ่งนี้มีเวลาว่างไหม", call("get_available_slots", date="2026-11-18"),
+                         AIMessage(content="วันพุธที่ 18 พฤศจิกายน 2026 มีเวลาว่าง 08:00, 08:30, 09:00, 09:30 น. ครับ ต้องการเวลาไหนครับ"))
+        self.assertEqual([item["label"] for item in self.choices], ["08:00", "08:30", "09:00", "09:30"])
+        self.assertEqual(self.choices[3]["value"], "ขอจองนัดวันที่ 18/11/2026 เวลา 09:30")
+
+        self.model_inputs.clear()
+        self.say("ต้องการนัดเวลา 9.30", call("create_appointment", date="2026-11-18", time="9.30"))
+        sent = self.model_inputs[0]
+        # The earlier question and the bot's offer reach the model as real turns.
+        self.assertEqual([m.type for m in sent[1:]], ["human", "ai", "human"])
+        self.assertIn("วันพุธที่ 18", sent[2].content)
+        self.assertIn("09:30", self.history[-1].content)
+        self.assertEqual(self.pending[0]["args"], {"date": "2026-11-18", "time": "09:30"})
+
     def test_saturday_request_is_refused_with_a_real_alternative(self):
         reply = self.say("ขอจองวันเสาร์ 9 โมง", call("create_appointment", date="2026-11-21", time="09:00"))
         self.assertIn("วันหยุด", reply)
@@ -161,7 +196,8 @@ class AppointmentFlowTests(unittest.TestCase):
         self.say("ยกเลิกนัดแล้วจองใหม่ 20/11 9 โมง", both)
         self.assertEqual([item["action"] for item in self.pending], ["cancel"])
         self.assertEqual(self.backend.writes(), [])
-        reply = self.say("ดูนัดหมาย", call("get_my_appointments"), AIMessage(content="คุณมีนัดวันพุธที่ 18 พฤศจิกายน เวลา 10:00 น. ครับ"))
+        reply = self.say("ดูนัดหมาย", call("get_my_appointments"))
+        self.assertIn("วันพุธที่ 18 พฤศจิกายน 2026 เวลา 10:00", reply)
         self.assertIsNone(self.pending)
         self.assertNotIn("evt01", repr(self.history))
 
